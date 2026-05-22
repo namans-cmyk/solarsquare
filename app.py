@@ -29,9 +29,45 @@ try:
         PageBreak, Image, KeepTogether
     )
     from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
     REPORTLAB_OK = True
+    # Register a font that supports ₹ symbol. DejaVu Sans is bundled with most systems.
+    DEJAVU_PATHS = [
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',  # Linux
+        '/Library/Fonts/DejaVuSans.ttf',  # Mac (if installed via Homebrew)
+        '/System/Library/Fonts/Supplemental/Arial Unicode.ttf',  # Mac built-in (has ₹)
+        '/Library/Fonts/Arial Unicode.ttf',  # Older Mac
+    ]
+    DEJAVU_BOLD_PATHS = [
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+        '/Library/Fonts/DejaVuSans-Bold.ttf',
+    ]
+    FONT_REGULAR = 'Helvetica'
+    FONT_BOLD = 'Helvetica-Bold'
+    for path in DEJAVU_PATHS:
+        if os.path.exists(path):
+            try:
+                pdfmetrics.registerFont(TTFont('PDFFont', path))
+                FONT_REGULAR = 'PDFFont'
+                print(f'[pdf] Using font: {path}')
+                # Try bold too
+                for bpath in DEJAVU_BOLD_PATHS:
+                    if os.path.exists(bpath):
+                        pdfmetrics.registerFont(TTFont('PDFFont-Bold', bpath))
+                        FONT_BOLD = 'PDFFont-Bold'
+                        break
+                else:
+                    FONT_BOLD = 'PDFFont'  # fall back to regular if no bold
+                break
+            except Exception as e:
+                print(f'[pdf] Could not register {path}: {e}')
+    else:
+        print('[pdf] No Unicode font found. ₹ symbol may not render. Run: brew install --cask font-dejavu')
 except ImportError:
     REPORTLAB_OK = False
+    FONT_REGULAR = 'Helvetica'
+    FONT_BOLD = 'Helvetica-Bold'
     print('[warning] reportlab not installed. PDF reports will not work.')
     print('[warning] Install with: pip3 install reportlab --break-system-packages')
 import random
@@ -886,249 +922,526 @@ GREY_LIGHT = colors.HexColor('#f5f5f7') if REPORTLAB_OK else None
 
 
 def build_pdf_report(data, city_name):
-    """Generate a PDF report from solver result data. Returns bytes."""
+    """Editorial PDF report: minimal palette, generous whitespace, serif display."""
     if not REPORTLAB_OK:
         raise RuntimeError('reportlab not installed. Run: pip3 install reportlab --break-system-packages')
 
+    # ---- Page geometry: A4 portrait, wide margins ----
+    PAGE_W, PAGE_H = A4
+    MARGIN = 22 * mm
+    CONTENT_W = PAGE_W - 2 * MARGIN
+
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
-        buf, pagesize=landscape(A4),
-        leftMargin=12 * mm, rightMargin=12 * mm,
-        topMargin=12 * mm, bottomMargin=12 * mm,
-        title=f'SolarSquare Vendor Plan — {city_name}'
+        buf, pagesize=A4,
+        leftMargin=MARGIN, rightMargin=MARGIN,
+        topMargin=22 * mm, bottomMargin=22 * mm,
+        title=f'Vendor Plan — {city_name}',
+        author='SolarSquare Energy',
     )
 
-    styles = getSampleStyleSheet()
-    h1 = ParagraphStyle('h1', parent=styles['Heading1'], textColor=BRAND_COLOR,
-                        fontSize=22, spaceAfter=4, leading=26)
-    h2 = ParagraphStyle('h2', parent=styles['Heading2'], textColor=BRAND_COLOR,
-                        fontSize=13, spaceAfter=6, spaceBefore=10, leading=16)
-    body = ParagraphStyle('body', parent=styles['BodyText'], fontSize=9, leading=12)
-    sub = ParagraphStyle('sub', parent=styles['BodyText'], fontSize=9, textColor=colors.HexColor('#666666'),
-                         spaceAfter=8)
-    small = ParagraphStyle('small', parent=styles['BodyText'], fontSize=8, textColor=colors.HexColor('#888888'))
+    # ---- Palette: black + slate + ONE accent ----
+    INK = colors.HexColor('#0f1419')         # near-black body
+    SLATE = colors.HexColor('#5e6470')       # secondary
+    MUTED = colors.HexColor('#9aa0a8')       # tertiary
+    HAIRLINE = colors.HexColor('#dadce0')    # rules
+    ACCENT = colors.HexColor('#131ac3')      # the ONE color
+    POSITIVE = colors.HexColor('#1a7f37')    # for positive profit only
+    NEGATIVE = colors.HexColor('#b91c1c')    # for losses only
+    PAPER = colors.HexColor('#ffffff')
 
-    story = []
+    # ---- Try a serif for display, fall back to default ----
+    SERIF = 'Times-Roman'
+    SERIF_BOLD = 'Times-Bold'
+    SERIF_ITALIC = 'Times-Italic'
+    SANS = FONT_REGULAR
+    SANS_BOLD = FONT_BOLD
 
-    # ---- HEADER ----
-    story.append(Paragraph(f'SolarSquare Vendor Plan — {city_name}', h1))
-    now = datetime.datetime.now().strftime('%d %B %Y, %H:%M')
-    story.append(Paragraph(f'Generated {now}  |  Status: {data["status"]}  |  Pxx achieved: P{round(data["pxx_achieved"]*100)}', sub))
+    # ---- Helpers ----
+    def P(text, font=SANS, size=10, color=INK, align=TA_LEFT, leading=None):
+        return Paragraph(text, ParagraphStyle(
+            'p', fontName=font, fontSize=size,
+            leading=leading or size * 1.4, textColor=color, alignment=align,
+        ))
 
-    # ---- KPI CARDS (top row) ----
     def fmt_inr(v):
-        v = abs(v); 
-        if v >= 1e7: return f'₹{v/1e7:.2f}Cr'
-        if v >= 1e5: return f'₹{v/1e5:.2f}L'
-        if v >= 1e3: return f'₹{v/1e3:.0f}K'
-        return f'₹{v:.0f}'
+        v = round(v)
+        sign = '-' if v < 0 else ''
+        v = abs(v)
+        if v >= 1e7: return f'{sign}₹{v/1e7:.2f} Cr'
+        if v >= 1e5: return f'{sign}₹{v/1e5:.2f} L'
+        if v >= 1e3: return f'{sign}₹{v/1e3:.1f}K'
+        return f'{sign}₹{v}'
 
-    kpi_data = [[
-        Paragraph(f'<b>{data["v2"]}</b>', ParagraphStyle('kn', fontSize=20, textColor=BRAND_COLOR, alignment=TA_CENTER)),
-        Paragraph(f'<b>{data["v1"]}</b>', ParagraphStyle('kn', fontSize=20, textColor=BRAND_COLOR, alignment=TA_CENTER)),
-        Paragraph(f'<b>{data["v2"]+data["v1"]}</b>', ParagraphStyle('kn', fontSize=20, textColor=BRAND_COLOR, alignment=TA_CENTER)),
-        Paragraph(f'<b>{fmt_inr(data["total_payout"])}</b>', ParagraphStyle('kn', fontSize=20, textColor=BRAND_COLOR, alignment=TA_CENTER)),
-        Paragraph(f'<b>{data["savings_pct"]}%</b>', ParagraphStyle('kn', fontSize=20, textColor=ACCENT_GREEN, alignment=TA_CENTER)),
-        Paragraph(f'<b>{data["total_slips"]}</b>', ParagraphStyle('kn', fontSize=20, textColor=BRAND_COLOR, alignment=TA_CENTER)),
-    ], [
-        Paragraph('2-Install vendors', ParagraphStyle('kl', fontSize=8, textColor=colors.grey, alignment=TA_CENTER)),
-        Paragraph('1-Install vendors', ParagraphStyle('kl', fontSize=8, textColor=colors.grey, alignment=TA_CENTER)),
-        Paragraph('Total vendors', ParagraphStyle('kl', fontSize=8, textColor=colors.grey, alignment=TA_CENTER)),
-        Paragraph('Modelled payout', ParagraphStyle('kl', fontSize=8, textColor=colors.grey, alignment=TA_CENTER)),
-        Paragraph('SSE savings', ParagraphStyle('kl', fontSize=8, textColor=colors.grey, alignment=TA_CENTER)),
-        Paragraph('Total slips/mo', ParagraphStyle('kl', fontSize=8, textColor=colors.grey, alignment=TA_CENTER)),
-    ]]
-    kpi_table = Table(kpi_data, colWidths=[44*mm]*6, rowHeights=[14*mm, 6*mm])
-    kpi_table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,-1), BRAND_LIGHT),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('BOX', (0,0), (-1,-1), 0.5, BRAND_COLOR),
-        ('LINEAFTER', (0,0), (-2,-1), 0.3, colors.white),
-        ('TOPPADDING', (0,0), (-1,-1), 4),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
-    ]))
-    story.append(kpi_table)
-
-    # Profit distribution by percentile (replaces the simple avg/min strip)
-    story.append(Spacer(1, 6))
+    def fmt_inr_indian(v):
+        v = round(v)
+        sign = '-' if v < 0 else ''
+        v = abs(v)
+        if v < 1000: return f'{sign}₹{v}'
+        s = str(v)
+        last_three = s[-3:]; rest = s[:-3]
+        parts = []
+        while len(rest) > 2:
+            parts.append(rest[-2:]); rest = rest[:-2]
+        if rest: parts.append(rest)
+        return f'{sign}₹{",".join(reversed(parts))},{last_three}'
 
     def pct(arr, p):
-        if not arr:
-            return None
+        if not arr: return None
         s = sorted(arr)
         if p <= 0: return s[0]
         if p >= 100: return s[-1]
         idx = (p / 100.0) * (len(s) - 1)
-        lo = int(idx)
-        hi = lo + 1 if lo + 1 < len(s) else lo
+        lo = int(idx); hi = lo + 1 if lo + 1 < len(s) else lo
         return s[lo] + (s[hi] - s[lo]) * (idx - lo)
+
+    def rule(thickness=0.5, color=HAIRLINE, spacer_before=0, spacer_after=0):
+        """Horizontal rule across content width."""
+        elements = []
+        if spacer_before: elements.append(Spacer(1, spacer_before))
+        t = Table([['']], colWidths=[CONTENT_W], rowHeights=[0.1])
+        t.setStyle(TableStyle([('LINEABOVE', (0,0), (-1,0), thickness, color)]))
+        elements.append(t)
+        if spacer_after: elements.append(Spacer(1, spacer_after))
+        return elements
+
+    now = datetime.datetime.now()
+    date_str = now.strftime('%d %B %Y')
+
+    story = []
+
+    # ============================================================
+    # COVER PAGE
+    # ============================================================
+
+    # Tiny eyebrow
+    story.append(P('SOLARSQUARE', font=SANS_BOLD, size=8, color=ACCENT))
+    story.append(Spacer(1, 4 * mm))
+
+    # Title — serif, large
+    title = P(f'Vendor Plan', font=SERIF, size=42, color=INK, leading=46)
+    story.append(title)
+
+    # City + subtitle
+    story.append(P(f'<i>{city_name}</i>', font=SERIF_ITALIC, size=20, color=SLATE, leading=24))
+
+    story.append(Spacer(1, 14 * mm))
+    story.extend(rule(thickness=0.5, color=HAIRLINE))
+    story.append(Spacer(1, 8 * mm))
+
+    # Date + meta line
+    meta_tbl = Table([[
+        P(date_str, font=SANS, size=9, color=SLATE),
+        P(f'Status · {data.get("status", "—")}', font=SANS, size=9, color=SLATE, align=TA_CENTER),
+        P(f'Pxx achieved · P{round(data["pxx_achieved"]*100)}', font=SANS, size=9, color=SLATE, align=TA_RIGHT),
+    ]], colWidths=[CONTENT_W/3]*3)
+    meta_tbl.setStyle(TableStyle([
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+    ]))
+    story.append(meta_tbl)
+
+    story.append(Spacer(1, 16 * mm))
+
+    # ============================================================
+    # HEADLINE NUMBERS — one per row, magazine style
+    # ============================================================
+
+    total_v = data['v2'] + data['v1']
+
+    def headline(label, value, value_color=INK, sub=None):
+        rows = [
+            [P(label.upper(), font=SANS_BOLD, size=8, color=MUTED)],
+            [P(value, font=SERIF, size=36, color=value_color, leading=40)],
+        ]
+        if sub:
+            rows.append([P(sub, font=SANS, size=9, color=SLATE)])
+        t = Table(rows, colWidths=[CONTENT_W])
+        t.setStyle(TableStyle([
+            ('LEFTPADDING', (0,0), (-1,-1), 0),
+            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+            ('TOPPADDING', (0,0), (-1,-1), 0),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 2),
+        ]))
+        return t
+
+    # Three headline numbers stacked, each as its own block with a rule between
+    story.append(headline('Total vendors', str(total_v),
+                          sub=f'{data["v2"]} two-install vendors, {data["v1"]} one-install vendors'))
+    story.append(Spacer(1, 10 * mm))
+    story.extend(rule())
+    story.append(Spacer(1, 8 * mm))
+
+    story.append(headline('Monthly payout', fmt_inr_indian(data['total_payout']),
+                          sub=f'{fmt_inr(data["total_payout"])} across {sum(data["daily"])} sites'))
+    story.append(Spacer(1, 10 * mm))
+    story.extend(rule())
+    story.append(Spacer(1, 8 * mm))
+
+    story.append(headline('SSE savings', f'{data["savings_pct"]}%',
+                          value_color=ACCENT,
+                          sub=f'vs. baseline pricing of ₹{int(10572):,}/site'))
+
+    # ============================================================
+    # PAGE 2: KEY METRICS GRID (numbers + small labels, no boxes)
+    # ============================================================
+    story.append(PageBreak())
+    story.append(P('At a Glance', font=SERIF, size=22, color=INK, leading=26))
+    story.append(Spacer(1, 2 * mm))
+    story.append(P(f'Summary of the {city_name} optimisation as on {date_str}.',
+                   font=SANS, size=10, color=SLATE))
+    story.append(Spacer(1, 12 * mm))
+
+    # Grid: 2 cols, several rows
+    def mini_metric(label, value, sub=None, accent=False):
+        col = ACCENT if accent else INK
+        rows = [
+            [P(label.upper(), font=SANS_BOLD, size=7, color=MUTED, leading=9)],
+            [P(value, font=SERIF, size=22, color=col, leading=26)],
+        ]
+        if sub:
+            rows.append([P(sub, font=SANS, size=8, color=SLATE, leading=11)])
+        t = Table(rows, colWidths=[CONTENT_W/2 - 4*mm])
+        t.setStyle(TableStyle([
+            ('LEFTPADDING', (0,0), (-1,-1), 0),
+            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+            ('TOPPADDING', (0,0), (-1,-1), 0),
+            ('BOTTOMPADDING', (0,0), (-1,0), 4),
+            ('BOTTOMPADDING', (0,1), (-1,-1), 2),
+        ]))
+        return t
+
+    avg_daily = sum(data['daily']) / len(data['daily'])
+    peak_to_avg = max(data['daily']) / avg_daily if avg_daily else 1
+    margin_pct = round(100 * data['total_profit'] / data['total_payout'], 1) if data.get('total_payout') else 0
+    total_dd_pairs = sum(data['pair_count_per_day'])
+    total_sd_sites = sum(data['sd_count_per_day'])
+
+    grid_pairs = [
+        [mini_metric('Sites served', str(sum(data['daily'])),
+                     sub=f'Peak day {data["peak_day"]+1}, {max(data["daily"])} sites'),
+         mini_metric('Slips covered', str(data['total_slips']),
+                     sub='Deterministic monthly slip count')],
+        [mini_metric('Monthly profit', fmt_inr(data['total_profit']),
+                     sub=f'{margin_pct}% margin', accent=data['total_profit'] >= 0),
+         mini_metric('Vendor fixed cost', fmt_inr(data['total_cost']),
+                     sub='Aggregate across all vendors')],
+        [mini_metric('DD pairs in month', str(total_dd_pairs),
+                     sub=f'{total_dd_pairs*2} sites via double-install days'),
+         mini_metric('SD sites in month', str(total_sd_sites),
+                     sub='Single-install days')],
+    ]
+    for pair in grid_pairs:
+        row_t = Table([pair], colWidths=[CONTENT_W/2, CONTENT_W/2])
+        row_t.setStyle(TableStyle([
+            ('LEFTPADDING', (0,0), (-1,-1), 0),
+            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+        ]))
+        story.append(row_t)
+        story.append(Spacer(1, 8 * mm))
+
+    # ============================================================
+    # PROFIT DISTRIBUTION
+    # ============================================================
+    story.append(Spacer(1, 4 * mm))
+    story.append(P('Profit Distribution', font=SERIF, size=18, color=INK, leading=22))
+    story.append(Spacer(1, 2 * mm))
+    story.append(P('Per-vendor profit by percentile within each pool.',
+                   font=SANS, size=10, color=SLATE))
+    story.append(Spacer(1, 6 * mm))
 
     profits_2i = [v['profit'] for v in data['vendors'] if v['type'] == '2-Install']
     profits_1i = [v['profit'] for v in data['vendors'] if v['type'] == '1-Install']
-    avg_2i = sum(profits_2i) / len(profits_2i) if profits_2i else None
-    avg_1i = sum(profits_1i) / len(profits_1i) if profits_1i else None
+    avg_2i = sum(profits_2i) / len(profits_2i) if profits_2i else 0
+    avg_1i = sum(profits_1i) / len(profits_1i) if profits_1i else 0
 
-    def cell(v):
-        if v is None: return '—'
-        if v < 0: return f'<font color="red">-{fmt_inr(abs(v))}</font>'
-        return f'<font color="green">{fmt_inr(v)}</font>'
+    def prof_cell(v):
+        if v is None:
+            return P('—', font=SANS, size=10, color=MUTED, align=TA_RIGHT)
+        c = POSITIVE if v >= 0 else NEGATIVE
+        return P(fmt_inr(v), font=SANS, size=10, color=c, align=TA_RIGHT)
 
-    pct_styles = ParagraphStyle('pctc', fontSize=9, alignment=TA_RIGHT)
-    pct_rows = [['Percentile', '2-Install', '1-Install']]
-    for label, p in [('P0 (min)', 0), ('P25', 25), ('P50 (median)', 50), ('P75', 75), ('P90', 90), ('P100 (max)', 100)]:
+    pct_rows = [[
+        P('', font=SANS_BOLD, size=8, color=MUTED),
+        P('2-INSTALL', font=SANS_BOLD, size=8, color=MUTED, align=TA_RIGHT),
+        P('1-INSTALL', font=SANS_BOLD, size=8, color=MUTED, align=TA_RIGHT),
+    ]]
+    for label, p in [('Min (P0)', 0), ('P25', 25), ('Median (P50)', 50),
+                     ('P75', 75), ('P90', 90), ('Max (P100)', 100)]:
         pct_rows.append([
-            label,
-            Paragraph(cell(pct(profits_2i, p)), pct_styles),
-            Paragraph(cell(pct(profits_1i, p)), pct_styles),
+            P(label, font=SANS, size=10, color=INK),
+            prof_cell(pct(profits_2i, p)),
+            prof_cell(pct(profits_1i, p)),
         ])
     pct_rows.append([
-        Paragraph('<b>Average</b>', ParagraphStyle('pavg', fontSize=9, alignment=TA_LEFT)),
-        Paragraph(f'<b>{cell(avg_2i)}</b>', pct_styles),
-        Paragraph(f'<b>{cell(avg_1i)}</b>', pct_styles),
+        P('Average', font=SANS_BOLD, size=10, color=INK),
+        P(fmt_inr(avg_2i), font=SANS_BOLD, size=11, color=ACCENT, align=TA_RIGHT),
+        P(fmt_inr(avg_1i), font=SANS_BOLD, size=11, color=ACCENT, align=TA_RIGHT),
     ])
-    pct_table = Table(pct_rows, colWidths=[60*mm, 90*mm, 90*mm])
+    pct_table = Table(pct_rows, colWidths=[CONTENT_W*0.4, CONTENT_W*0.3, CONTENT_W*0.3])
     pct_table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), BRAND_COLOR),
-        ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0,0), (-1,-1), 9),
-        ('ALIGN', (1,0), (-1,-1), 'RIGHT'),
+        # Header bottom rule
+        ('LINEBELOW', (0,0), (-1,0), 0.75, INK),
+        # Row separators
+        ('LINEBELOW', (0,1), (-1,-2), 0.25, HAIRLINE),
+        # Average row top rule
+        ('LINEABOVE', (0,-1), (-1,-1), 0.75, INK),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('GRID', (0,0), (-1,-1), 0.25, colors.lightgrey),
-        ('ROWBACKGROUNDS', (0,1), (-1,-2), [colors.white, GREY_LIGHT]),
-        ('BACKGROUND', (0,-1), (-1,-1), BRAND_LIGHT),
-        ('LINEABOVE', (0,-1), (-1,-1), 1.2, BRAND_COLOR),
-        ('TOPPADDING', (0,0), (-1,-1), 5),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ('TOPPADDING', (0,0), (-1,-1), 8),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 8),
     ]))
-    story.append(Paragraph('Profit Distribution', h2))
     story.append(pct_table)
 
-    # ---- PER-VENDOR P&L ----
-    story.append(Paragraph('Per-Vendor P&amp;L', h2))
-    pnl_header = ['Vendor', 'Type', 'DD', 'SD', 'SL', 'Idle', 'Sites', 'Fixed', 'Payout', 'Profit']
-    pnl_rows = [pnl_header]
+    # ============================================================
+    # PER-VENDOR P&L TABLE
+    # ============================================================
+    story.append(PageBreak())
+    story.append(P('Per-Vendor P&amp;L', font=SERIF, size=22, color=INK, leading=26))
+    story.append(Spacer(1, 2 * mm))
+    story.append(P(f'Detailed financials for all {total_v} vendors.',
+                   font=SANS, size=10, color=SLATE))
+    story.append(Spacer(1, 8 * mm))
+
+    header_row = [
+        P('VENDOR', font=SANS_BOLD, size=7, color=MUTED),
+        P('TYPE', font=SANS_BOLD, size=7, color=MUTED),
+        P('DD', font=SANS_BOLD, size=7, color=MUTED, align=TA_RIGHT),
+        P('SD', font=SANS_BOLD, size=7, color=MUTED, align=TA_RIGHT),
+        P('SL', font=SANS_BOLD, size=7, color=MUTED, align=TA_RIGHT),
+        P('IDLE', font=SANS_BOLD, size=7, color=MUTED, align=TA_RIGHT),
+        P('SITES', font=SANS_BOLD, size=7, color=MUTED, align=TA_RIGHT),
+        P('FIXED', font=SANS_BOLD, size=7, color=MUTED, align=TA_RIGHT),
+        P('PAYOUT', font=SANS_BOLD, size=7, color=MUTED, align=TA_RIGHT),
+        P('PROFIT', font=SANS_BOLD, size=7, color=MUTED, align=TA_RIGHT),
+    ]
+    pnl_rows = [header_row]
     for v in data['vendors']:
-        profit_color = 'green' if v['profit'] >= 0 else 'red'
+        c = POSITIVE if v['profit'] >= 0 else NEGATIVE
         pnl_rows.append([
-            v['name'],
-            v['type'],
-            str(v['dd_days']),
-            str(v['sd_sites']),
-            str(v['sl_days']),
-            str(v['idle_days']),
-            str(v['sites']),
-            fmt_inr(v['fixed_cost']),
-            fmt_inr(v['payout']),
-            Paragraph(f'<font color="{profit_color}">{"-" if v["profit"]<0 else ""}{fmt_inr(v["profit"])}</font>',
-                      ParagraphStyle('pp', fontSize=8, alignment=TA_RIGHT)),
+            P(v['name'], font=SANS, size=9, color=INK),
+            P(v['type'].replace('-Install', '-Inst'), font=SANS, size=9, color=SLATE),
+            P(str(v['dd_days']), font=SANS, size=9, color=INK, align=TA_RIGHT),
+            P(str(v['sd_sites']), font=SANS, size=9, color=INK, align=TA_RIGHT),
+            P(str(v['sl_days']), font=SANS, size=9, color=INK, align=TA_RIGHT),
+            P(str(v['idle_days']), font=SANS, size=9, color=MUTED, align=TA_RIGHT),
+            P(str(v['sites']), font=SANS, size=9, color=INK, align=TA_RIGHT),
+            P(fmt_inr(v['fixed_cost']), font=SANS, size=9, color=SLATE, align=TA_RIGHT),
+            P(fmt_inr(v['payout']), font=SANS, size=9, color=INK, align=TA_RIGHT),
+            P(fmt_inr(v['profit']), font=SANS_BOLD, size=10, color=c, align=TA_RIGHT),
         ])
-    pnl_table = Table(pnl_rows, colWidths=[18*mm, 22*mm, 12*mm, 12*mm, 12*mm, 12*mm, 14*mm, 22*mm, 24*mm, 24*mm], repeatRows=1)
+    # Totals
+    tot_dd = sum(v['dd_days'] for v in data['vendors'])
+    tot_sd = sum(v['sd_sites'] for v in data['vendors'])
+    tot_sl = sum(v['sl_days'] for v in data['vendors'])
+    tot_idle = sum(v['idle_days'] for v in data['vendors'])
+    tot_sites = sum(v['sites'] for v in data['vendors'])
+    pnl_rows.append([
+        P('Total', font=SANS_BOLD, size=10, color=INK),
+        P(f'{total_v} vendors', font=SANS, size=9, color=SLATE),
+        P(str(tot_dd), font=SANS_BOLD, size=10, color=INK, align=TA_RIGHT),
+        P(str(tot_sd), font=SANS_BOLD, size=10, color=INK, align=TA_RIGHT),
+        P(str(tot_sl), font=SANS_BOLD, size=10, color=INK, align=TA_RIGHT),
+        P(str(tot_idle), font=SANS_BOLD, size=10, color=MUTED, align=TA_RIGHT),
+        P(str(tot_sites), font=SANS_BOLD, size=10, color=INK, align=TA_RIGHT),
+        P(fmt_inr(data['total_cost']), font=SANS_BOLD, size=10, color=INK, align=TA_RIGHT),
+        P(fmt_inr(data['total_payout']), font=SANS_BOLD, size=10, color=INK, align=TA_RIGHT),
+        P(fmt_inr(data['total_profit']), font=SANS_BOLD, size=11,
+          color=POSITIVE if data['total_profit'] >= 0 else NEGATIVE, align=TA_RIGHT),
+    ])
+
+    col_widths = [16, 18, 8, 8, 8, 9, 11, 22, 25, 28]
+    total_units = sum(col_widths)
+    col_widths = [w / total_units * CONTENT_W for w in col_widths]
+
+    pnl_table = Table(pnl_rows, colWidths=col_widths, repeatRows=1)
     pnl_table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), BRAND_COLOR),
-        ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0,0), (-1,-1), 8),
-        ('ALIGN', (2,0), (-1,-1), 'RIGHT'),
+        ('LINEBELOW', (0,0), (-1,0), 0.75, INK),
+        ('LINEBELOW', (0,1), (-1,-2), 0.25, HAIRLINE),
+        ('LINEABOVE', (0,-1), (-1,-1), 0.75, INK),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('GRID', (0,0), (-1,-1), 0.25, colors.lightgrey),
-        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, GREY_LIGHT]),
-        ('TOPPADDING', (0,0), (-1,-1), 3),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ('LEFTPADDING', (0,0), (-1,-1), 4),
+        ('RIGHTPADDING', (0,0), (-1,-1), 4),
+        ('TOPPADDING', (0,0), (-1,-1), 6),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
     ]))
     story.append(pnl_table)
 
-    # ---- DAILY DEMAND ----
+    story.append(Spacer(1, 6 * mm))
+    story.append(P(
+        'DD = double install day · SD = single install day · SL = slip recovery. '
+        'Profit = Payout − Fixed monthly cost.',
+        font=SANS, size=8, color=MUTED
+    ))
+
+    # ============================================================
+    # DEMAND PROFILE
+    # ============================================================
     story.append(PageBreak())
-    story.append(Paragraph('Daily Demand', h2))
+    story.append(P('Demand Profile', font=SERIF, size=22, color=INK, leading=26))
+    story.append(Spacer(1, 2 * mm))
+    story.append(P(f'Sites per day across the {len(data["daily"])}-day month. Peak occurs on day {data["peak_day"]+1}.',
+                   font=SANS, size=10, color=SLATE))
+    story.append(Spacer(1, 10 * mm))
+
     daily = data['daily']
     peak_day = data['peak_day']
-    # Build demand table with bars rendered as filled cells
     max_d = max(daily) if daily else 1
-    bar_rows = [['Day'] + [str(i+1) for i in range(len(daily))]]
-    bar_rows.append(['Sites'] + [str(v) for v in daily])
-    bar_table = Table(bar_rows, colWidths=[14*mm] + [(270/len(daily))*mm]*len(daily), rowHeights=[6*mm, 6*mm])
-    style = [
-        ('FONTSIZE', (0,0), (-1,-1), 7),
-        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('BACKGROUND', (0,0), (0,-1), BRAND_LIGHT),
-        ('FONTNAME', (0,0), (0,-1), 'Helvetica-Bold'),
-        ('GRID', (0,0), (-1,-1), 0.25, colors.lightgrey),
-    ]
-    style.append(('BACKGROUND', (peak_day+1, 0), (peak_day+1, -1), colors.HexColor('#ef9f27')))
-    bar_table.setStyle(TableStyle(style))
-    story.append(bar_table)
-    story.append(Spacer(1, 4))
-    story.append(Paragraph(f'<i>Peak day: Day {peak_day+1} with {daily[peak_day]} sites (highlighted orange).</i>', small))
+    n_days = len(daily)
 
-    # ---- VENDOR ROSTER CALENDAR ----
-    story.append(Paragraph('Vendor Roster Calendar', h2))
+    # Minimal bar chart: thin vertical lines, peak in accent
+    # Build a single-row table where each cell is a vertical bar via height
+    BAR_AREA_H = 50 * mm
+    bar_cells = []
+    for i, v in enumerate(daily):
+        h = max(1, int((v / max_d) * BAR_AREA_H))
+        col = ACCENT if i == peak_day else INK
+        # Use a thin Table inner box
+        bar_cells.append([Table([['']], colWidths=[(CONTENT_W / n_days) - 0.5*mm],
+                                rowHeights=[h * 1.0],
+                                style=TableStyle([('BACKGROUND', (0,0), (-1,-1), col)]))])
+    # We'll render bars as a single row of bottom-aligned mini tables
+    bar_row = Table([bar_cells[i*n_days:(i+1)*n_days] for i in range(0, 1)]
+                    if False else [[Table([[
+                        Table([['']], colWidths=[(CONTENT_W/n_days) - 0.5*mm],
+                              rowHeights=[max(1, int((v/max_d)*BAR_AREA_H))],
+                              style=TableStyle([('BACKGROUND', (0,0), (-1,-1), ACCENT if i==peak_day else INK)]))
+                    ]], colWidths=[(CONTENT_W/n_days)], rowHeights=[BAR_AREA_H + 2*mm],
+                    style=TableStyle([('VALIGN', (0,0), (-1,-1), 'BOTTOM'),
+                                      ('LEFTPADDING', (0,0), (-1,-1), 0),
+                                      ('RIGHTPADDING', (0,0), (-1,-1), 0),
+                                      ('TOPPADDING', (0,0), (-1,-1), 0),
+                                      ('BOTTOMPADDING', (0,0), (-1,-1), 0)]))
+                    for i, v in enumerate(daily)]],
+                    colWidths=[CONTENT_W/n_days] * n_days)
+    bar_row.setStyle(TableStyle([
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ('TOPPADDING', (0,0), (-1,-1), 0),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+        ('VALIGN', (0,0), (-1,-1), 'BOTTOM'),
+        ('LINEBELOW', (0,0), (-1,-1), 0.5, INK),
+    ]))
+    story.append(bar_row)
+
+    # Day number labels under bars
+    day_labels = [P(str(i+1) if (i+1) % 5 == 0 or i == 0 or i == n_days-1 or i == peak_day else '',
+                    font=SANS, size=7,
+                    color=ACCENT if i == peak_day else MUTED,
+                    align=TA_CENTER) for i in range(n_days)]
+    label_row = Table([day_labels], colWidths=[CONTENT_W/n_days]*n_days, rowHeights=[5*mm])
+    label_row.setStyle(TableStyle([
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+    ]))
+    story.append(label_row)
+
+    story.append(Spacer(1, 8 * mm))
+    # Stats inline
+    stats_tbl = Table([[
+        P(f'<font name="{SANS_BOLD}" size="9" color="#9aa0a8">PEAK</font><br/>'
+          f'<font name="{SERIF}" size="20" color="#131ac3">{max(daily)}</font><br/>'
+          f'<font name="{SANS}" size="8" color="#5e6470">sites · day {peak_day+1}</font>',
+          font=SANS, size=9, leading=12),
+        P(f'<font name="{SANS_BOLD}" size="9" color="#9aa0a8">AVERAGE</font><br/>'
+          f'<font name="{SERIF}" size="20" color="#0f1419">{avg_daily:.1f}</font><br/>'
+          f'<font name="{SANS}" size="8" color="#5e6470">sites/day</font>',
+          font=SANS, size=9, leading=12),
+        P(f'<font name="{SANS_BOLD}" size="9" color="#9aa0a8">PEAK/AVG</font><br/>'
+          f'<font name="{SERIF}" size="20" color="#0f1419">{peak_to_avg:.2f}×</font><br/>'
+          f'<font name="{SANS}" size="8" color="#5e6470">ratio</font>',
+          font=SANS, size=9, leading=12),
+        P(f'<font name="{SANS_BOLD}" size="9" color="#9aa0a8">MONTH TOTAL</font><br/>'
+          f'<font name="{SERIF}" size="20" color="#0f1419">{sum(daily)}</font><br/>'
+          f'<font name="{SANS}" size="8" color="#5e6470">sites</font>',
+          font=SANS, size=9, leading=12),
+    ]], colWidths=[CONTENT_W/4]*4)
+    stats_tbl.setStyle(TableStyle([
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+    ]))
+    story.append(stats_tbl)
+
+    # ============================================================
+    # ROSTER CALENDAR — minimal: single letter per cell, no fills
+    # ============================================================
+    story.append(PageBreak())
+    story.append(P('Roster Calendar', font=SERIF, size=22, color=INK, leading=26))
+    story.append(Spacer(1, 2 * mm))
+    story.append(P('D = double install · S = single install · s = slip recovery · · = rest day',
+                   font=SANS, size=10, color=SLATE))
+    story.append(Spacer(1, 8 * mm))
+
     roster = data['roster']
     n_vendors = len(roster)
     days = len(daily)
-    # Header: Day numbers
-    cal_header = ['Day'] + [v['name'] for v in data['vendors']]
+
+    # Header
+    cal_header = [P('', font=SANS, size=7)]
+    for v in data['vendors']:
+        cal_header.append(P(v['name'], font=SANS_BOLD, size=6, color=MUTED, align=TA_CENTER))
     cal_rows = [cal_header]
-    cell_styles = []
+
     for d in range(days):
-        row = [f'D{d+1}']
+        row = [P(f'D{d+1}', font=SANS_BOLD if d == peak_day else SANS,
+                 size=7, color=ACCENT if d == peak_day else SLATE, align=TA_LEFT)]
         for vi in range(n_vendors):
             cell = roster[vi][d]
-            # cell is a dict: {'type': 'DD'|'SD'|'SL'|'idle', 'label': '...'}
             kind = cell.get('type', 'idle')
-            cell_label = cell.get('label', '')
             if kind == 'DD':
-                label = f'DD\n{cell_label}'
+                # Bold uppercase D
+                row.append(P('D', font=SANS_BOLD, size=9, color=ACCENT, align=TA_CENTER))
             elif kind == 'SD':
-                label = f'SD\n{cell_label}'
+                row.append(P('S', font=SANS, size=9, color=INK, align=TA_CENTER))
             elif kind == 'SL':
-                label = 'SL'
+                row.append(P('s', font=SANS_BOLD, size=9, color=NEGATIVE, align=TA_CENTER))
             else:
-                label = '—'
-            row.append(label)
+                row.append(P('·', font=SANS, size=9, color=MUTED, align=TA_CENTER))
         cal_rows.append(row)
-    col_count = len(cal_header)
-    col_widths = [12*mm] + [(265 / max(1, n_vendors)) * mm] * n_vendors
-    cal_table = Table(cal_rows, colWidths=col_widths, repeatRows=1)
+
+    day_col = 11 * mm
+    vendor_col = (CONTENT_W - day_col) / max(1, n_vendors)
+    col_widths_cal = [day_col] + [vendor_col] * n_vendors
+
+    cal_table = Table(cal_rows, colWidths=col_widths_cal, repeatRows=1)
     cstyle = [
-        ('FONTSIZE', (0,0), (-1,-1), 6),
-        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('LINEBELOW', (0,0), (-1,0), 0.75, INK),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('BACKGROUND', (0,0), (-1,0), BRAND_COLOR),
-        ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-        ('BACKGROUND', (0,1), (0,-1), BRAND_LIGHT),
-        ('FONTNAME', (0,1), (0,-1), 'Helvetica-Bold'),
-        ('GRID', (0,0), (-1,-1), 0.2, colors.lightgrey),
-        ('TOPPADDING', (0,0), (-1,-1), 2),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 2),
+        ('LEFTPADDING', (0,0), (-1,-1), 1),
+        ('RIGHTPADDING', (0,0), (-1,-1), 1),
+        ('TOPPADDING', (0,0), (-1,-1), 3),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ('LINEBELOW', (0,1), (-1,-1), 0.15, HAIRLINE),
     ]
-    # Color code DD (green), SD (light blue), SL (red), idle (grey)
-    for d in range(days):
-        row_idx = d + 1
-        for vi in range(n_vendors):
-            col_idx = vi + 1
-            cell = roster[vi][d]
-            kind = cell.get('type', 'idle')
-            if kind == 'DD':
-                cstyle.append(('BACKGROUND', (col_idx, row_idx), (col_idx, row_idx), colors.HexColor('#c8e6c9')))
-            elif kind == 'SD':
-                cstyle.append(('BACKGROUND', (col_idx, row_idx), (col_idx, row_idx), colors.HexColor('#e1ecf9')))
-            elif kind == 'SL':
-                cstyle.append(('BACKGROUND', (col_idx, row_idx), (col_idx, row_idx), colors.HexColor('#fad4d4')))
     cal_table.setStyle(TableStyle(cstyle))
     story.append(cal_table)
 
-    # ---- FOOTER ----
-    story.append(Spacer(1, 10))
-    story.append(Paragraph(
-        f'<i>SolarSquare 2-Install-A-Day Vendor Optimizer  |  Generated {now}</i>',
-        small
-    ))
+    # ---- Page decoration ----
+    def add_page_decoration(canvas, doc_):
+        canvas.saveState()
+        # Top thin accent line
+        canvas.setStrokeColor(ACCENT)
+        canvas.setLineWidth(1.5)
+        canvas.line(MARGIN, PAGE_H - 14*mm, MARGIN + 30*mm, PAGE_H - 14*mm)
+        # Footer thin hairline
+        canvas.setStrokeColor(HAIRLINE)
+        canvas.setLineWidth(0.3)
+        canvas.line(MARGIN, 16*mm, PAGE_W - MARGIN, 16*mm)
+        # Footer text
+        canvas.setFont(SANS, 7)
+        canvas.setFillColor(MUTED)
+        canvas.drawString(MARGIN, 11*mm, f'SolarSquare Vendor Plan')
+        canvas.drawCentredString(PAGE_W/2, 11*mm, city_name)
+        canvas.drawRightString(PAGE_W - MARGIN, 11*mm, f'{doc_.page} · {date_str}')
+        canvas.restoreState()
 
-    doc.build(story)
+    doc.build(story, onFirstPage=add_page_decoration, onLaterPages=add_page_decoration)
     return buf.getvalue()
+
 
 
 @app.route('/report', methods=['POST'])
