@@ -19,6 +19,9 @@ import traceback as tb_mod
 import io
 import datetime
 
+# Cluster data — all 28 clusters with P50/P75/P90 daily distributions and slab mix
+from clusters import CLUSTER_DATA
+
 try:
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib import colors
@@ -83,26 +86,123 @@ except Exception as e:
     ORTOOLS_ERR = f'{type(e).__name__}: {e}'
 
 
-def bell_curve_demand(total, days, peak_ratio):
-    if peak_ratio <= 1.001:
+# Pune historical install patterns - P90 distribution derived from 11 real months
+# (Jun 2025 - Apr 2026, 3,031 total installs).
+#
+# Method: for each day-of-month (1-30), compute what % of that month's total
+# installs landed on that day. Across 11 months, we have 11 percentages per day.
+# Take the 90th percentile -- the upper-bound % we should plan for any given day.
+# This captures the day-by-day worst case across history (e.g., D14 had occasional
+# 6.5% spikes, D30 routinely hits 6%+) instead of smoothing it away.
+#
+# Each entry stores percentile values per day for 30-day grid. Months with 28-31
+# days were resampled to 30-day grid before percentile calc.
+
+# Per-day percentile arrays (each list = % of monthly total on that day-of-month)
+# Indices 0-29 represent days 1-30. Use linear interpolation between percentiles.
+PUNE_DAY_DISTRIBUTION = {
+    # Each value is "% of monthly total installs on this day-of-month, at percentile X"
+    # Range across 11 months: [P50, P75, P90]
+    'P50': [1.49, 2.07, 1.97, 1.88, 2.77, 3.12, 2.64, 3.21, 3.02, 2.87,
+            3.65, 3.35, 3.24, 3.81, 3.70, 3.51, 3.39, 3.36, 3.32, 3.55,
+            3.47, 3.11, 3.53, 3.05, 4.32, 3.49, 3.48, 4.36, 4.84, 5.65],
+    'P75': [2.50, 2.23, 2.69, 2.97, 3.30, 3.80, 3.36, 3.78, 3.70, 3.95,
+            4.28, 3.83, 4.03, 4.28, 4.19, 3.95, 3.64, 4.08, 3.62, 4.27,
+            4.03, 4.14, 4.12, 4.60, 4.86, 4.18, 3.93, 4.75, 5.41, 5.85],
+    'P90': [3.40, 2.53, 2.90, 4.41, 3.55, 4.35, 4.25, 4.12, 3.93, 4.34,
+            4.55, 4.06, 4.25, 6.52, 4.24, 4.50, 4.53, 4.35, 3.82, 4.85,
+            4.58, 4.35, 4.81, 4.97, 5.07, 4.59, 4.46, 5.58, 5.66, 6.63],
+}
+
+
+def _resample_to_days(arr, target_days):
+    """Resample a daily array to target_days, preserving the shape."""
+    src_days = len(arr)
+    if src_days == target_days:
+        return arr[:]
+    out = []
+    for i in range(target_days):
+        src = i / target_days * src_days
+        lo = int(src)
+        hi = min(lo + 1, src_days - 1)
+        frac = src - lo
+        v = arr[lo] * (1 - frac) + arr[hi] * frac
+        out.append(v)
+    return out
+
+
+def end_skewed_demand(total, days, peak_ratio, skew_pct=100, cluster='Pune'):
+    """Demand curve using P-percentile of historical day-of-month install
+    percentages, blended with a flat distribution by skew_pct.
+
+    peak_ratio acts as a stress-level selector (which historical percentile
+    to use). skew_pct controls how much of that historical shape to apply
+    versus a flat distribution.
+
+    peak_ratio:
+      <= 1.45: uses P50 (typical month)
+      1.45-1.55: uses P75 (slightly stressed)
+      >= 1.55: uses P90 (planning-grade stress)
+
+    skew_pct:
+      0   = perfectly flat (every day gets total/days sites)
+      50  = halfway between flat and historical
+      100 = full historical shape
+
+    cluster: which cluster's historical distribution to use. Falls back to Pune
+             if the cluster name is unknown.
+    """
+    if peak_ratio <= 1.001 or skew_pct <= 0.5:
+        # Flat distribution (either explicitly requested or skew is ~0)
         base = total // days
         rem = total - base * days
         arr = [base] * days
-        mid = days // 2
         for i in range(rem):
-            arr[(i + mid) % days] += 1
+            arr[i % days] += 1
         return arr
-    mu = (days - 1) / 2
-    peak_value = round((total / days) * peak_ratio)
-    sigma = days / (2 + (peak_ratio - 1) * 4)
-    raw = [math.exp(-0.5 * ((i - mu) / sigma) ** 2) for i in range(days)]
-    max_raw = max(raw)
-    arr = [round(x * peak_value / max_raw) for x in raw]
+
+    # Pick percentile level based on peak_ratio slider
+    if peak_ratio <= 1.45:
+        pct_label = 'P50'
+    elif peak_ratio <= 1.55:
+        pct_label = 'P75'
+    else:
+        pct_label = 'P90'
+
+    # Get distribution for the selected cluster, falling back to Pune
+    cluster_info = CLUSTER_DATA.get(cluster) or CLUSTER_DATA.get('Pune')
+    if cluster_info is None:
+        # Last-resort fallback: hardcoded Pune
+        base_dist = PUNE_DAY_DISTRIBUTION[pct_label]
+    else:
+        base_dist = cluster_info[pct_label]  # 30 values, % shares
+
+    # Resample to target days if not 30
+    resampled = _resample_to_days(base_dist, days)
+
+    # Normalize the historical shape so percentages sum to 100
+    total_pct = sum(resampled)
+    if total_pct <= 0:
+        return [round(total / days)] * days
+    hist_normalized = [v * 100 / total_pct for v in resampled]
+
+    # Flat distribution percentage (each day = 100/days %)
+    flat_pct = 100.0 / days
+
+    # Blend: skew=0 → all flat, skew=100 → all historical
+    weight = skew_pct / 100.0
+    blended = [(1 - weight) * flat_pct + weight * v for v in hist_normalized]
+
+    # Distribute total sites by blended percentage
+    distributed = [v / 100 * total for v in blended]
+    arr = [round(v) for v in distributed]
+
+    # Fix rounding drift to match total
     diff = total - sum(arr)
-    peak_idx = round(mu)
+    peak_idx = arr.index(max(arr)) if arr else 0
     order = sorted((i for i in range(days) if i != peak_idx),
-                   key=lambda i: (abs(i - mu), i))
-    if diff > 0:
+                   key=lambda i: abs(i - peak_idx))
+    if diff < 0:
         order = order[::-1]
     oi = 0
     safety = 0
@@ -117,6 +217,11 @@ def bell_curve_demand(total, days, peak_ratio):
         oi += 1
         safety += 1
     return arr
+
+
+# Backward-compat alias
+def bell_curve_demand(total, days, peak_ratio, skew_pct=100, cluster='Pune'):
+    return end_skewed_demand(total, days, peak_ratio, skew_pct, cluster)
 
 
 def int_distribute(total, props):
@@ -156,45 +261,55 @@ def compute_daily_demand(daily, slab_mix, dd_elig_slabs, elig_pct):
     return dd_pairs, sd_slabs
 
 
-def monte_carlo_slips(pair_count, sd_by_day, sl2, sl1, percentile, runs=500, seed=42):
-    rng = random.Random(seed)
+def _poisson_inverse_cdf(lam, p):
+    """Return smallest k such that P(X <= k) >= p, where X ~ Poisson(lam).
+    Pure-Python implementation, deterministic.
+    """
+    if lam <= 0:
+        return 0
+    # P(X=0) = e^-lam. Iteratively compute CDF.
+    import math as _m
+    pmf = _m.exp(-lam)
+    cdf = pmf
+    k = 0
+    while cdf < p and k < 1000:
+        k += 1
+        pmf = pmf * lam / k
+        cdf += pmf
+    return k
+
+
+def monte_carlo_slips(pair_count, sd_by_day, sl2, sl1, percentile, runs=None, seed=None):
+    """Deterministic Poisson-based slip distribution (replaces old Monte Carlo).
+
+    For each day d (>=1), slips that originate from day d-1's work follow a
+    Poisson distribution with mean = (2*pair_count[d-1]*sl2 + sd_by_day[d-1]*sl1).
+    Per-day Pxx is the inverse Poisson CDF at the requested percentile.
+
+    `runs` and `seed` are kept for backward compatibility but are ignored.
+    Output schema matches the original function exactly.
+    """
     days = len(pair_count)
     dd_sites = [p * 2 for p in pair_count]
     total_slips = round(sum(dd_sites) * sl2 + sum(sd_by_day) * sl1)
-    weights = []
-    w_sum = 0.0
-    for d in range(days - 1):
-        w = dd_sites[d] * sl2 + sd_by_day[d] * sl1
-        weights.append(w)
-        w_sum += w
-    if w_sum == 0:
+
+    if total_slips == 0:
         return {'total_slips': 0, 'expected_sl': [0]*days, 'pxx_sl': [0]*days}
-    cum = []
-    acc = 0.0
-    for w in weights:
-        acc += w / w_sum
-        cum.append(acc)
+
+    # Expected slips that land on day d come from day d-1's work
     expected_sl = [0.0] * days
     for d in range(days - 1):
-        expected_sl[d + 1] = total_slips * weights[d] / w_sum
-    daily_samples = [[] for _ in range(days)]
-    for _ in range(runs):
-        day_counts = [0] * days
-        for _s in range(total_slips):
-            u = rng.random()
-            src = days - 2
-            for i, c in enumerate(cum):
-                if u <= c:
-                    src = i
-                    break
-            day_counts[src + 1] += 1
-        for d in range(days):
-            daily_samples[d].append(day_counts[d])
-    pxx_sl = []
-    for arr in daily_samples:
-        arr.sort()
-        idx = min(len(arr) - 1, int(len(arr) * percentile))
-        pxx_sl.append(arr[idx])
+        # day d's work generates slips for day d+1
+        lam = dd_sites[d] * sl2 + sd_by_day[d] * sl1
+        expected_sl[d + 1] = lam
+
+    # Per-day Pxx via Poisson inverse CDF
+    pxx_sl = [0] * days
+    for d in range(1, days):
+        lam = expected_sl[d]
+        if lam > 0:
+            pxx_sl[d] = _poisson_inverse_cdf(lam, percentile)
+
     return {'total_slips': total_slips, 'expected_sl': expected_sl, 'pxx_sl': pxx_sl}
 
 
@@ -219,8 +334,9 @@ def solve_schedule(v2, v1, days, pair_count, sd_count, peak_day, sl_needed_by_da
         # SL: at least sl_needed_by_day (Pxx coverage). May exceed if schedule allows.
         model.Add(sum(is_sl[v][d] for v in range(total_v)) >= sl_needed_by_day[d])
 
-    # HARD CONSTRAINT: total monthly SL must equal the deterministic slip count.
-    # All 87 (or whatever) slips must get recovered somewhere in the month.
+    # HARD CONSTRAINT: total monthly SL must be AT LEAST the deterministic slip count.
+    # We use >= (not ==) so the solver always finds a feasible schedule.
+    # Excess SL beyond the theoretical count is then converted to idle in post-processing.
     model.Add(sum(is_sl[v][d] for v in range(total_v) for d in range(days)) >= total_slips_required)
 
     for v in range(v2):
@@ -255,10 +371,15 @@ def solve_schedule(v2, v1, days, pair_count, sd_count, peak_day, sl_needed_by_da
             model.Add(dd_total >= min_dd_per_v2)
             model.Add(dd_total <= max_dd_per_v2)
 
+    # No SL distribution objective: solver places SL freely based on feasibility only.
+    # The hard constraints (next-day-after-work, total = required count) are sufficient.
+
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(time_limit)
     solver.parameters.num_search_workers = 8
-    solver.parameters.stop_after_first_solution = True
+    solver.parameters.random_seed = 42
+    # Removed stop_after_first_solution: search for optimal within time_limit
+    # (still bounded by the per-call time budget, so won't run forever)
 
     status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -429,6 +550,7 @@ def optimize_slabs_cpsat(activity, v2, days, dd_pairs_per_day, sd_slabs_per_day,
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(time_limit)
     solver.parameters.num_search_workers = 8
+    solver.parameters.random_seed = 42
 
     status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -496,14 +618,20 @@ def find_optimal_fast(daily, dd_pairs_per_day, sd_slabs_per_day, pair_count, sd_
         if p < target_pxx and p not in pxx_levels:
             pxx_levels.append(p)
 
-    # Wall-clock cap: stop searching after time_limit_sec
-    import time
-    search_start = time.time()
-    HARD_CAP = float(time_limit_sec)
-    print(f'[solver] Hard cap: {HARD_CAP}s wall clock')
+    # Iteration-based caps (replaces wall-clock for cross-machine determinism):
+    # - SOFT_CAP = 50: after 50 iterations, stop IF we have a profitable solution
+    # - HARD_CAP = 100: stop unconditionally after 100 iterations
+    # Each iteration is one (v2, v1, pxx) attempt. Determinism: same params → same iteration count → same result.
+    SOFT_ITER_CAP = 50
+    HARD_ITER_CAP = 100
+    print(f'[solver] Iteration caps: soft={SOFT_ITER_CAP} (return first profitable), hard={HARD_ITER_CAP}')
 
-    # Tight budgets to fit within HARD_CAP. Phase A: 3s feasibility, Phase B: 12s optimization.
-    per_call_time = 3
+    # Per-call CP-SAT time budget. Tuned for 1-2 minute total runtime:
+    # - 1s per Phase A iteration × up to 100 iterations ≈ 100s
+    # - Plus ~30 Phase B at 2s ≈ 60s (only profitable iterations)
+    # - Plus 15s polish at end
+    # Total typical: 1-2 min depending on how many iterations are profitable.
+    per_call_time = 1
 
     # Track best partial solution in case no fully-profitable exists
     best_partial = None
@@ -557,10 +685,13 @@ def find_optimal_fast(daily, dd_pairs_per_day, sd_slabs_per_day, pair_count, sd_
             iteration_found_any = False
             for pxx in pxx_levels:
                 iter_count += 1
-                # Wall-clock cap
-                elapsed = time.time() - search_start
-                if elapsed > HARD_CAP:
-                    print(f'[solver] Wall-clock cap reached: {elapsed:.1f}s > {HARD_CAP}s')
+                # Iteration-based caps (deterministic across machines)
+                if iter_count > HARD_ITER_CAP:
+                    print(f'[solver] Hard iteration cap reached: {iter_count} > {HARD_ITER_CAP}')
+                    done = True
+                    break
+                if iter_count > SOFT_ITER_CAP and profitable_candidates:
+                    print(f'[solver] Soft iteration cap reached at iter {iter_count} with {len(profitable_candidates)} profitable candidate(s)')
                     done = True
                     break
                 # Smart early stop: if we have profitable candidates and N more iterations
@@ -588,27 +719,15 @@ def find_optimal_fast(daily, dd_pairs_per_day, sd_slabs_per_day, pair_count, sd_
                 if not feas:
                     # Pxx too high for this vendor count — but lower Pxx might work
                     continue
-                while sum(sl_needed) < mc['total_slips']:
-                    bumped = False
-                    for d in sorted(range(days), key=lambda i: -mc['pxx_sl'][i]):
-                        slack = v2 + v1 - pair_count[d] - sd_count[d]
-                        if sl_needed[d] < slack:
-                            sl_needed[d] += 1
-                            bumped = True
-                            break
-                    if not bumped:
-                        break
-                # min_working_days: force balanced workload.
-                # Total work = DD + SD + SL = sum(pair_count) + sum(sd_count) + sum(sl_needed)
-                # Min per vendor = floor((total_work - max_slack) / total_v)
-                # where max_slack lets some vendors work slightly more than others.
-                # Simpler: aim for ~90% of avg, capped at max_working_days
-                total_work = sum(pair_count) + sum(sd_count) + sum(sl_needed)
-                avg_work = total_work / (v2 + v1)
-                min_working_days = max(0, int(avg_work * 0.9))
-                # Don't exceed max
-                min_working_days = min(min_working_days, max_working_days - 2)
-                print(f'[solver] iter {iter_count}: v2={v2}, v1={v1}, pxx={pxx}, target_total_sl={mc["total_slips"]}, min_work={min_working_days}, max_work={max_working_days}')
+                # NOTE: do NOT bump sl_needed up to slack max. Slack is just "vendors not
+                # doing DD/SD that day" — but SL requires day-before work too, so effective
+                # slack is lower. Bumping creates per-day requirements the solver can't meet.
+                # Instead: use Pxx-based per-day minimums, and let the total==82 constraint
+                # distribute remaining SL where the solver finds capacity.
+
+                # min_working_days disabled. Vendors with no work just idle on those days.
+                min_working_days = 0
+                print(f'[solver] iter {iter_count}: v2={v2}, v1={v1}, pxx={pxx}, target_total_sl={mc["total_slips"]}, max_work={max_working_days}')
                 activity, status = solve_schedule(v2, v1, days, pair_count, sd_count,
                                                   peak_day, sl_needed, mc['total_slips'], max_working_days, min_working_days, per_call_time)
                 if activity is None:
@@ -653,8 +772,8 @@ def find_optimal_fast(daily, dd_pairs_per_day, sd_slabs_per_day, pair_count, sd_
                 if all_prof:
                     # Phase B per candidate is QUICK — just enough to differentiate candidates.
                     # The winning candidate gets a full polish at the end.
-                    remaining = HARD_CAP - (time.time() - search_start)
-                    phase_b_time = min(5, max(2, int((remaining - 30) / 3)))  # save 30s for polish
+                    # Fixed 2s budget per Phase B for determinism + 1-2 min total cap.
+                    phase_b_time = 2
                     print(f'[solver]   Phase A profitable. Running quick Phase B ({phase_b_time}s)...')
                     optimized, opt_status = optimize_slabs_cpsat(
                         activity, v2, days, dd_pairs_per_day, sd_slabs_per_day,
@@ -676,11 +795,17 @@ def find_optimal_fast(daily, dd_pairs_per_day, sd_slabs_per_day, pair_count, sd_
                     else:
                         print(f'[solver]   Phase B failed ({opt_status}), using Phase A')
 
+                # Total profit across all vendors
+                total_payout_cand = sum(payouts)
+                total_fixed_cand = v2 * cost_2i + v1 * cost_1i
+                total_profit_cand = total_payout_cand - total_fixed_cand
+
                 candidate = {
                     'v2': v2, 'v1': v1, 'roster': roster, 'status': status,
                     'pxx_achieved': pxx, 'sl_needed': sl_needed, 'mc': mc, 'payouts': payouts,
                     'all_profitable': all_prof, 'unprofitable_amount': unprof_sum,
                     'activity': activity,  # for polish phase
+                    'total_profit': total_profit_cand,
                 }
 
                 # Compute min for tracking
@@ -694,11 +819,11 @@ def find_optimal_fast(daily, dd_pairs_per_day, sd_slabs_per_day, pair_count, sd_
                     # Compute min profit for ranking
                     min_overall = min(min_2i_prof, min_1i_prof)
                     candidate['min_profit'] = min_overall
-                    # Check if this improves over current best
+                    # Check if this improves over current best (by total profit primary)
                     if profitable_candidates:
-                        current_best = min(profitable_candidates, key=lambda c: (c['v2']+c['v1'], -c['min_profit']))
-                        current_best_score = (current_best['v2']+current_best['v1'], -current_best['min_profit'])
-                        new_score = (v2 + v1, -min_overall)
+                        current_best = min(profitable_candidates, key=lambda c: (-c['total_profit'], c['v2']+c['v1']))
+                        current_best_score = (-current_best['total_profit'], current_best['v2']+current_best['v1'])
+                        new_score = (-total_profit_cand, v2 + v1)
                         if new_score < current_best_score:
                             iterations_since_improvement = 0
                         else:
@@ -706,7 +831,7 @@ def find_optimal_fast(daily, dd_pairs_per_day, sd_slabs_per_day, pair_count, sd_
                     else:
                         iterations_since_improvement = 0
                     profitable_candidates.append(candidate)
-                    print(f'[solver]   PROFITABLE candidate: v2={v2}, v1={v1}, pxx={pxx}, min_profit=₹{min_overall:.0f} (no_improve_streak={iterations_since_improvement})')
+                    print(f'[solver]   PROFITABLE candidate: v2={v2}, v1={v1}, pxx={pxx}, total_profit=₹{total_profit_cand:.0f}, min_profit=₹{min_overall:.0f} (no_improve_streak={iterations_since_improvement})')
                 else:
                     # Track best partial
                     if unprof_sum < best_partial_score:
@@ -718,19 +843,19 @@ def find_optimal_fast(daily, dd_pairs_per_day, sd_slabs_per_day, pair_count, sd_
 
     # Done iterating. Pick best candidate.
     if profitable_candidates:
-        # Sort by: (1) fewest vendors, (2) highest min profit, (3) tightest spread
+        # Sort by: (1) highest total profit, (2) fewest vendors, (3) highest min profit
+        # Total profit is the primary business outcome. Vendor count is a tiebreaker
+        # (fewer vendors = simpler ops, less reliance risk). Min profit ensures fairness.
         def candidate_score(c):
-            spread = max(c['payouts'][:c['v2']]) - min(c['payouts'][:c['v2']]) if c['v2'] > 0 else 0
-            return (c['v2'] + c['v1'], -c['min_profit'], spread)
+            return (-c['total_profit'], c['v2'] + c['v1'], -c['min_profit'])
         profitable_candidates.sort(key=candidate_score)
         best = profitable_candidates[0]
         print(f'[solver] Searched {iter_count} iterations. Found {len(profitable_candidates)} profitable candidates.')
-        print(f'[solver] Initial pick: v2={best["v2"]}, v1={best["v1"]}, min_profit=₹{best["min_profit"]:.0f}')
+        print(f'[solver] Initial pick: v2={best["v2"]}, v1={best["v1"]}, total_profit=₹{best["total_profit"]:.0f}, min_profit=₹{best["min_profit"]:.0f}')
 
-        # POLISH PHASE: spend remaining budget squeezing the spread on the winner.
-        remaining = HARD_CAP - (time.time() - search_start)
-        polish_time = max(5, int(remaining - 3))
-        if polish_time >= 5 and 'activity' in best:
+        # POLISH PHASE: fixed 10s budget for determinism + 1-2 min total cap.
+        polish_time = 10
+        if 'activity' in best:
             print(f'[solver] Polish phase: {polish_time}s with heavy spread weight (=10)')
             polished_result, polished_status = optimize_slabs_cpsat(
                 best['activity'], best['v2'], days, dd_pairs_per_day, sd_slabs_per_day,
@@ -767,7 +892,9 @@ def find_optimal_fast(daily, dd_pairs_per_day, sd_slabs_per_day, pair_count, sd_
         print(f'[solver] Exhausted search. Returning best partial: v2={best_partial["v2"]}, v1={best_partial["v1"]}, unprofitable_sum=₹{best_partial_score:.0f}')
         best_partial['all_attempts'] = all_attempts
         return best_partial
-    return None
+    # No feasible schedule at all — return diagnostics dict so caller can show what was tried
+    print(f'[solver] No feasible schedule found in any iteration. Tried {len(all_attempts)} combinations.')
+    return {'_diagnostic_only': True, 'all_attempts': all_attempts}
 
 
 def run_solver(params):
@@ -789,8 +916,10 @@ def run_solver(params):
     target_pxx = float(params.get('target_pxx', 0.75))
     time_limit = int(params.get('time_limit_sec', 30))
     max_working_days = int(params.get('max_working_days', 26))
+    skew_pct = float(params.get('skew_pct', 100))
+    cluster = params.get('cluster', 'Pune')
 
-    daily = bell_curve_demand(total_sites, days, peak_ratio)
+    daily = bell_curve_demand(total_sites, days, peak_ratio, skew_pct, cluster)
     dd_pairs, sd_slabs = compute_daily_demand(daily, slab_mix, dd_elig_slabs, elig_pct)
     pair_count = [len(p) for p in dd_pairs]
     sd_count = [sum(s) for s in sd_slabs]
@@ -804,21 +933,156 @@ def run_solver(params):
                                peak_day, sl2_rate, sl1_rate, target_pxx, slab_rates_2i, slab_rates_1i,
                                dd_discount, cost_2i, cost_1i, time_limit, max_working_days)
 
-    if result is None:
+    if result is None or result.get('_diagnostic_only'):
+        diag_attempts = result.get('all_attempts', []) if result else []
         return {
             'ok': False,
-            'reason': 'No profitable solution found AND no feasible schedule found. At this slip rate + cost combination, the math doesn\'t work. Try: lowering slip%, raising DD discount, lowering 2i fixed cost, or lowering peak ratio.',
+            'reason': 'No feasible schedule found in any vendor combination tried. The constraints (slip count, peak load, DD limits) are too tight at these settings. Try: lowering slip%, raising DD discount, lowering peak ratio, or reducing total sites.',
             'daily': daily,
             'pair_count_per_day': pair_count,
             'sd_count_per_day': sd_count,
             'peak_day': peak_day,
             'total_slips': round(sum([p*2 for p in pair_count]) * sl2_rate + sum(sd_count) * sl1_rate),
+            'all_attempts': diag_attempts,
         }
 
     v2 = result['v2']
     v1 = result['v1']
     total_v = v2 + v1
     roster = result['roster']
+
+    # POST-PROCESS: redistribute which vendor owns each SL cell, based on
+    # probabilistic slip ownership (which vendor's site actually slipped).
+    #
+    # Logic:
+    #   1. Solver placed SL on certain days — keep those days (the columns).
+    #   2. For each individual site done in the schedule, coin-flip (seeded) whether
+    #      it slipped. The vendor that did that site is "owed" 1 SL recovery.
+    #   3. Sum slip ownership per vendor → desired SL count per vendor.
+    #   4. The solver placed SL cells on specific (vendor, day) positions. We
+    #      reshuffle these cells across vendors — each day, the SL count on that
+    #      day stays the same, but WHICH vendors have SL that day changes to
+    #      match the desired ownership counts.
+    #
+    # The total SL count in the roster stays exactly what the solver gave us.
+    # No SL is gained or lost. We just change rows, not columns.
+    import random as _random
+    rng = _random.Random(42)
+
+    # Step 1: simulate which sites slip → count owned slips per vendor
+    desired_sl_per_vendor = [0] * total_v
+    for vi in range(total_v):
+        for d in range(days):
+            cell = roster[vi][d]
+            if cell[0] == 'DD':
+                for _ in range(2):  # 2 sites per DD pair
+                    if rng.random() < sl2_rate:
+                        desired_sl_per_vendor[vi] += 1
+            elif cell[0] == 'SD':
+                if rng.random() < sl1_rate:
+                    desired_sl_per_vendor[vi] += 1
+
+    sim_total = sum(desired_sl_per_vendor)
+    print(f'[post] Simulated slip ownership: {sim_total} total slips owned by vendors')
+
+    # Step 2: find all SL cells in the solver roster, grouped by day
+    sl_days_to_vendors = {}  # day -> list of vendor indices that have SL that day
+    for d in range(days):
+        sl_days_to_vendors[d] = [
+            vi for vi in range(total_v) if roster[vi][d][0] == 'SL'
+        ]
+    solver_total_sl = sum(len(v) for v in sl_days_to_vendors.values())
+    theoretical_sl = result['mc']['total_slips']
+    print(f'[post] Solver placed {solver_total_sl} SL cells; theoretical = {theoretical_sl}')
+
+    # Step 2b: TRIM excess SL down to theoretical count.
+    # The solver uses >= so it may pad. We drop the excess (convert to idle in solver
+    # roster) so total SL matches the deterministic count from slip rates.
+    # Drop from later days first (less critical recovery-wise), and from days with
+    # excess cells beyond what's needed for Pxx coverage.
+    excess = solver_total_sl - theoretical_sl
+    if excess > 0:
+        # Build a flat list of (day, vendor) pairs to drop, prioritizing latest days
+        drop_candidates = []
+        for d in sorted(sl_days_to_vendors.keys(), reverse=True):  # latest days first
+            for vi in sl_days_to_vendors[d]:
+                drop_candidates.append((d, vi))
+        for d, vi in drop_candidates[:excess]:
+            roster[vi][d] = ('idle', None)
+            sl_days_to_vendors[d].remove(vi)
+        solver_total_sl = sum(len(v) for v in sl_days_to_vendors.values())
+        print(f'[post] Trimmed {excess} excess SL cells. Now {solver_total_sl} cells.')
+
+    # Step 3: reconcile desired vs available. The solver gave us N slots,
+    # ownership totals to M (M could be different due to coin-flip variance).
+    # We'll allocate the N slots to vendors as proportionally to desired as possible,
+    # capped by each vendor's actual desired count.
+    if solver_total_sl != sim_total and solver_total_sl > 0:
+        # Scale desired counts to sum to solver_total_sl
+        scale = solver_total_sl / sim_total if sim_total > 0 else 0
+        scaled = [d * scale for d in desired_sl_per_vendor]
+        # Round to integers, fix drift
+        new_counts = [int(round(s)) for s in scaled]
+        diff = solver_total_sl - sum(new_counts)
+        # Distribute the diff to highest-fractional-part vendors
+        fracs = sorted(range(total_v), key=lambda i: -(scaled[i] - int(scaled[i])))
+        for i in range(abs(diff)):
+            idx = fracs[i % len(fracs)]
+            new_counts[idx] += 1 if diff > 0 else -1
+            if new_counts[idx] < 0:
+                new_counts[idx] = 0
+        desired_sl_per_vendor = new_counts
+        print(f'[post] Scaled vendor SL targets to fit {solver_total_sl} solver slots')
+
+    # Step 4: redistribute SL cells day-by-day
+    # For each day, we have a count of SL slots. We pick which vendors get SL that day.
+    # Constraints: vendor must have worked the previous day (for d > 0); vendor must
+    # not already have DD/SD on that day.
+    # Strategy: prioritize vendors with high remaining-desired counts.
+    new_roster = [[(cell[0], cell[1]) for cell in row] for row in roster]
+    # Wipe all SL cells first; we'll rebuild
+    for vi in range(total_v):
+        for d in range(days):
+            if new_roster[vi][d][0] == 'SL':
+                new_roster[vi][d] = ('idle', None)
+
+    remaining_desired = desired_sl_per_vendor[:]
+    sl_placed = 0
+    sl_failed_to_place = 0
+
+    for d in sorted(sl_days_to_vendors.keys()):
+        slots_today = len(sl_days_to_vendors[d])
+        if slots_today == 0:
+            continue
+        # Find eligible vendors for SL on this day:
+        # - Not already doing DD or SD that day
+        # - Worked previous day (DD or SD) — required by SL rule
+        # - For day 0: SL not allowed at all (no prior day)
+        eligible = []
+        if d > 0:
+            for vi in range(total_v):
+                if new_roster[vi][d][0] in ('DD', 'SD', 'SL'):
+                    continue
+                prev = new_roster[vi][d - 1][0]
+                if prev not in ('DD', 'SD'):
+                    continue
+                eligible.append(vi)
+        # Sort eligible by remaining desired count (descending)
+        eligible.sort(key=lambda vi: -remaining_desired[vi])
+        # Place SL for top `slots_today` vendors
+        for vi in eligible[:slots_today]:
+            new_roster[vi][d] = ('SL', None)
+            sl_placed += 1
+            if remaining_desired[vi] > 0:
+                remaining_desired[vi] -= 1
+        # If fewer eligible vendors than slots needed, those SL slots are lost
+        # (extremely rare; solver should have made these placeable)
+        if len(eligible) < slots_today:
+            sl_failed_to_place += slots_today - len(eligible)
+
+    roster = new_roster
+    final_sl = sum(1 for vi in range(total_v) for d in range(days) if roster[vi][d][0] == 'SL')
+    print(f'[post] Redistributed SL: {sl_placed} placed, {sl_failed_to_place} slots lost, final count {final_sl}')
 
     vendors = []
     for vi in range(total_v):
@@ -882,6 +1146,16 @@ def run_solver(params):
     min_2i = min((v['profit'] for v in v2_list), default=0)
     min_1i = min((v['profit'] for v in v1_list), default=0)
 
+    # Compute slip breakdown by vendor type
+    # 2i sites (from DD): sum(pair_count) * 2; slips = those * sl2_rate
+    # 1i sites (from SD): sum(sd_count); slips on 1i-handled sites are tracked separately
+    # In our model, SD can be done by either 2i or 1i vendor — but slip rate applies to site type, not vendor
+    # Approximate: slips proportional to (sites of type) × (slip rate of type)
+    dd_sites_total = sum(pair_count) * 2
+    sd_sites_total = sum(sd_count)
+    slips_2i_est = round(dd_sites_total * sl2_rate)
+    slips_1i_est = round(sd_sites_total * sl1_rate)
+
     return {
         'ok': True,
         'all_profitable': result.get('all_profitable', True),
@@ -903,10 +1177,21 @@ def run_solver(params):
         'avg_1i': round(avg_1i),
         'min_2i': round(min_2i),
         'min_1i': round(min_1i),
-        'total_slips': result['mc']['total_slips'],
+        'total_slips': sum(v['sl_days'] for v in vendors),
+        'slips_theoretical': result['mc']['total_slips'],
         'pxx_target': target_pxx,
         'pxx_achieved': result['pxx_achieved'],
         'all_attempts': result.get('all_attempts', []),
+        # New for PDF
+        'slab_rates_2i': slab_rates_2i,
+        'slab_rates_1i': slab_rates_1i,
+        'slips_from_2i': slips_2i_est,
+        'slips_from_1i': slips_1i_est,
+        'sl2_rate': sl2_rate,
+        'sl1_rate': sl1_rate,
+        'baseline_per_site': baseline_per_site,
+        'peak_ratio': peak_ratio,
+        'skew_pct': skew_pct,
     }
 
 
@@ -922,35 +1207,37 @@ GREY_LIGHT = colors.HexColor('#f5f5f7') if REPORTLAB_OK else None
 
 
 def build_pdf_report(data, city_name):
-    """Editorial PDF report: minimal palette, generous whitespace, serif display."""
+    """CFO-grade PDF report. Editorial design, minimal palette.
+    Uses 'Rs' instead of ₹ to avoid font glyph issues.
+    """
     if not REPORTLAB_OK:
         raise RuntimeError('reportlab not installed. Run: pip3 install reportlab --break-system-packages')
 
-    # ---- Page geometry: A4 portrait, wide margins ----
+    # ---- Page geometry ----
     PAGE_W, PAGE_H = A4
-    MARGIN = 22 * mm
+    MARGIN = 20 * mm
     CONTENT_W = PAGE_W - 2 * MARGIN
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
         leftMargin=MARGIN, rightMargin=MARGIN,
-        topMargin=22 * mm, bottomMargin=22 * mm,
-        title=f'Vendor Plan — {city_name}',
+        topMargin=20 * mm, bottomMargin=20 * mm,
+        title=f'Vendor Plan - {city_name}',
         author='SolarSquare Energy',
     )
 
-    # ---- Palette: black + slate + ONE accent ----
-    INK = colors.HexColor('#0f1419')         # near-black body
-    SLATE = colors.HexColor('#5e6470')       # secondary
-    MUTED = colors.HexColor('#9aa0a8')       # tertiary
-    HAIRLINE = colors.HexColor('#dadce0')    # rules
-    ACCENT = colors.HexColor('#131ac3')      # the ONE color
-    POSITIVE = colors.HexColor('#1a7f37')    # for positive profit only
-    NEGATIVE = colors.HexColor('#b91c1c')    # for losses only
+    # ---- Palette ----
+    INK = colors.HexColor('#0f1419')
+    SLATE = colors.HexColor('#5e6470')
+    MUTED = colors.HexColor('#9aa0a8')
+    HAIRLINE = colors.HexColor('#dadce0')
+    ACCENT = colors.HexColor('#131ac3')
+    SOFT = colors.HexColor('#f8fafc')
+    POSITIVE = colors.HexColor('#1a7f37')
+    NEGATIVE = colors.HexColor('#b91c1c')
     PAPER = colors.HexColor('#ffffff')
 
-    # ---- Try a serif for display, fall back to default ----
     SERIF = 'Times-Roman'
     SERIF_BOLD = 'Times-Bold'
     SERIF_ITALIC = 'Times-Italic'
@@ -964,27 +1251,33 @@ def build_pdf_report(data, city_name):
             leading=leading or size * 1.4, textColor=color, alignment=align,
         ))
 
-    def fmt_inr(v):
+    def rs(v, with_unit=True):
+        """Format INR using 'Rs' to avoid PDF glyph issues."""
         v = round(v)
         sign = '-' if v < 0 else ''
         v = abs(v)
-        if v >= 1e7: return f'{sign}₹{v/1e7:.2f} Cr'
-        if v >= 1e5: return f'{sign}₹{v/1e5:.2f} L'
-        if v >= 1e3: return f'{sign}₹{v/1e3:.1f}K'
-        return f'{sign}₹{v}'
+        if v >= 1e7: out = f'{sign}Rs {v/1e7:.2f} Cr'
+        elif v >= 1e5: out = f'{sign}Rs {v/1e5:.2f} L'
+        elif v >= 1e3: out = f'{sign}Rs {v/1e3:.1f}K'
+        else: out = f'{sign}Rs {v}'
+        return out if with_unit else out.replace('Rs ', '')
 
-    def fmt_inr_indian(v):
+    def rs_full(v):
+        """Indian number system with Rs prefix."""
         v = round(v)
         sign = '-' if v < 0 else ''
         v = abs(v)
-        if v < 1000: return f'{sign}₹{v}'
+        if v < 1000: return f'{sign}Rs {v}'
         s = str(v)
-        last_three = s[-3:]; rest = s[:-3]
+        last_three = s[-3:]
+        rest = s[:-3]
         parts = []
         while len(rest) > 2:
-            parts.append(rest[-2:]); rest = rest[:-2]
-        if rest: parts.append(rest)
-        return f'{sign}₹{",".join(reversed(parts))},{last_three}'
+            parts.append(rest[-2:])
+            rest = rest[:-2]
+        if rest:
+            parts.append(rest)
+        return f'{sign}Rs {",".join(reversed(parts))},{last_three}'
 
     def pct(arr, p):
         if not arr: return None
@@ -995,215 +1288,427 @@ def build_pdf_report(data, city_name):
         lo = int(idx); hi = lo + 1 if lo + 1 < len(s) else lo
         return s[lo] + (s[hi] - s[lo]) * (idx - lo)
 
-    def rule(thickness=0.5, color=HAIRLINE, spacer_before=0, spacer_after=0):
-        """Horizontal rule across content width."""
-        elements = []
-        if spacer_before: elements.append(Spacer(1, spacer_before))
-        t = Table([['']], colWidths=[CONTENT_W], rowHeights=[0.1])
-        t.setStyle(TableStyle([('LINEABOVE', (0,0), (-1,0), thickness, color)]))
-        elements.append(t)
-        if spacer_after: elements.append(Spacer(1, spacer_after))
-        return elements
-
     now = datetime.datetime.now()
     date_str = now.strftime('%d %B %Y')
+
+    # Derived
+    daily = data['daily']
+    peak_day = data['peak_day']
+    n_days = len(daily)
+    total_v = data['v2'] + data['v1']
+    total_sites = sum(daily)
+    avg_daily = total_sites / n_days
+    peak_to_bau = max(daily) / avg_daily if avg_daily else 1
+    pair_counts = data['pair_count_per_day']
+    sd_counts = data['sd_count_per_day']
+    total_dd_pairs = sum(pair_counts)
+    total_dd_sites = total_dd_pairs * 2
+    total_sd_sites = sum(sd_counts)
+
+    # Slippage breakdown (deterministic from slip rates and site counts)
+    # We don't have sl2/sl1 explicitly in data but we can back-compute approximately
+    # Read these from the params if surfaced; otherwise use defaults
+    total_slips = data['total_slips']
+
+    profits_2i = [v['profit'] for v in data['vendors'] if v['type'] == '2-Install']
+    profits_1i = [v['profit'] for v in data['vendors'] if v['type'] == '1-Install']
+    payouts_2i = [v['payout'] for v in data['vendors'] if v['type'] == '2-Install']
+    payouts_1i = [v['payout'] for v in data['vendors'] if v['type'] == '1-Install']
+    avg_2i_profit = sum(profits_2i) / len(profits_2i) if profits_2i else 0
+    avg_1i_profit = sum(profits_1i) / len(profits_1i) if profits_1i else 0
+    avg_2i_payout = sum(payouts_2i) / len(payouts_2i) if payouts_2i else 0
+    avg_1i_payout = sum(payouts_1i) / len(payouts_1i) if payouts_1i else 0
 
     story = []
 
     # ============================================================
-    # COVER PAGE
+    # PAGE 1 — COVER
     # ============================================================
-
-    # Tiny eyebrow
     story.append(P('SOLARSQUARE', font=SANS_BOLD, size=8, color=ACCENT))
     story.append(Spacer(1, 4 * mm))
+    story.append(P('Vendor Plan', font=SERIF, size=38, color=INK, leading=42))
+    story.append(P(f'<i>{city_name}</i>', font=SERIF_ITALIC, size=18, color=SLATE, leading=22))
+    story.append(Spacer(1, 10 * mm))
 
-    # Title — serif, large
-    title = P(f'Vendor Plan', font=SERIF, size=42, color=INK, leading=46)
-    story.append(title)
-
-    # City + subtitle
-    story.append(P(f'<i>{city_name}</i>', font=SERIF_ITALIC, size=20, color=SLATE, leading=24))
-
-    story.append(Spacer(1, 14 * mm))
-    story.extend(rule(thickness=0.5, color=HAIRLINE))
-    story.append(Spacer(1, 8 * mm))
-
-    # Date + meta line
-    meta_tbl = Table([[
+    # Meta line
+    meta = Table([[
         P(date_str, font=SANS, size=9, color=SLATE),
-        P(f'Status · {data.get("status", "—")}', font=SANS, size=9, color=SLATE, align=TA_CENTER),
-        P(f'Pxx achieved · P{round(data["pxx_achieved"]*100)}', font=SANS, size=9, color=SLATE, align=TA_RIGHT),
+        P(f'Status: {data.get("status", "—")}', font=SANS, size=9, color=SLATE, align=TA_CENTER),
+        P(f'{total_v} vendors  |  {total_sites} sites  |  {data["savings_pct"]}% savings',
+          font=SANS, size=9, color=SLATE, align=TA_RIGHT),
     ]], colWidths=[CONTENT_W/3]*3)
-    meta_tbl.setStyle(TableStyle([
+    meta.setStyle(TableStyle([
         ('LEFTPADDING', (0,0), (-1,-1), 0),
         ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ('LINEABOVE', (0,0), (-1,0), 0.5, HAIRLINE),
+        ('LINEBELOW', (0,0), (-1,0), 0.5, HAIRLINE),
+        ('TOPPADDING', (0,0), (-1,-1), 6),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
     ]))
-    story.append(meta_tbl)
-
-    story.append(Spacer(1, 16 * mm))
-
-    # ============================================================
-    # HEADLINE NUMBERS — one per row, magazine style
-    # ============================================================
-
-    total_v = data['v2'] + data['v1']
-
-    def headline(label, value, value_color=INK, sub=None):
-        rows = [
-            [P(label.upper(), font=SANS_BOLD, size=8, color=MUTED)],
-            [P(value, font=SERIF, size=36, color=value_color, leading=40)],
-        ]
-        if sub:
-            rows.append([P(sub, font=SANS, size=9, color=SLATE)])
-        t = Table(rows, colWidths=[CONTENT_W])
-        t.setStyle(TableStyle([
-            ('LEFTPADDING', (0,0), (-1,-1), 0),
-            ('RIGHTPADDING', (0,0), (-1,-1), 0),
-            ('TOPPADDING', (0,0), (-1,-1), 0),
-            ('BOTTOMPADDING', (0,0), (-1,-1), 2),
-        ]))
-        return t
-
-    # Three headline numbers stacked, each as its own block with a rule between
-    story.append(headline('Total vendors', str(total_v),
-                          sub=f'{data["v2"]} two-install vendors, {data["v1"]} one-install vendors'))
-    story.append(Spacer(1, 10 * mm))
-    story.extend(rule())
-    story.append(Spacer(1, 8 * mm))
-
-    story.append(headline('Monthly payout', fmt_inr_indian(data['total_payout']),
-                          sub=f'{fmt_inr(data["total_payout"])} across {sum(data["daily"])} sites'))
-    story.append(Spacer(1, 10 * mm))
-    story.extend(rule())
-    story.append(Spacer(1, 8 * mm))
-
-    story.append(headline('SSE savings', f'{data["savings_pct"]}%',
-                          value_color=ACCENT,
-                          sub=f'vs. baseline pricing of ₹{int(10572):,}/site'))
-
-    # ============================================================
-    # PAGE 2: KEY METRICS GRID (numbers + small labels, no boxes)
-    # ============================================================
-    story.append(PageBreak())
-    story.append(P('At a Glance', font=SERIF, size=22, color=INK, leading=26))
-    story.append(Spacer(1, 2 * mm))
-    story.append(P(f'Summary of the {city_name} optimisation as on {date_str}.',
-                   font=SANS, size=10, color=SLATE))
+    story.append(meta)
     story.append(Spacer(1, 12 * mm))
 
-    # Grid: 2 cols, several rows
-    def mini_metric(label, value, sub=None, accent=False):
+    # KPI grid 2 rows x 3 cols (no boxes - just labels + big numbers)
+    def kpi(label, value, sub=None, accent=False):
         col = ACCENT if accent else INK
         rows = [
-            [P(label.upper(), font=SANS_BOLD, size=7, color=MUTED, leading=9)],
+            [P(label.upper(), font=SANS_BOLD, size=7, color=MUTED, leading=10)],
             [P(value, font=SERIF, size=22, color=col, leading=26)],
         ]
         if sub:
             rows.append([P(sub, font=SANS, size=8, color=SLATE, leading=11)])
-        t = Table(rows, colWidths=[CONTENT_W/2 - 4*mm])
+        t = Table(rows, colWidths=[CONTENT_W/3 - 4*mm])
         t.setStyle(TableStyle([
             ('LEFTPADDING', (0,0), (-1,-1), 0),
             ('RIGHTPADDING', (0,0), (-1,-1), 0),
             ('TOPPADDING', (0,0), (-1,-1), 0),
-            ('BOTTOMPADDING', (0,0), (-1,0), 4),
+            ('BOTTOMPADDING', (0,0), (-1,0), 3),
             ('BOTTOMPADDING', (0,1), (-1,-1), 2),
         ]))
         return t
 
-    avg_daily = sum(data['daily']) / len(data['daily'])
-    peak_to_avg = max(data['daily']) / avg_daily if avg_daily else 1
-    margin_pct = round(100 * data['total_profit'] / data['total_payout'], 1) if data.get('total_payout') else 0
-    total_dd_pairs = sum(data['pair_count_per_day'])
-    total_sd_sites = sum(data['sd_count_per_day'])
+    row1 = Table([[
+        kpi('Total vendors', str(total_v), sub=f'{data["v2"]} two-install + {data["v1"]} one-install'),
+        kpi('Monthly payout', rs(data['total_payout']), sub=rs_full(data['total_payout'])),
+        kpi('SSE savings', f'{data["savings_pct"]}%', sub=f'vs Rs 10,572/site baseline', accent=True),
+    ]], colWidths=[CONTENT_W/3]*3)
+    row1.setStyle(TableStyle([('VALIGN', (0,0), (-1,-1), 'TOP'),
+                              ('LEFTPADDING', (0,0), (-1,-1), 0),
+                              ('RIGHTPADDING', (0,0), (-1,-1), 0)]))
+    story.append(row1)
+    story.append(Spacer(1, 10 * mm))
 
-    grid_pairs = [
-        [mini_metric('Sites served', str(sum(data['daily'])),
-                     sub=f'Peak day {data["peak_day"]+1}, {max(data["daily"])} sites'),
-         mini_metric('Slips covered', str(data['total_slips']),
-                     sub='Deterministic monthly slip count')],
-        [mini_metric('Monthly profit', fmt_inr(data['total_profit']),
-                     sub=f'{margin_pct}% margin', accent=data['total_profit'] >= 0),
-         mini_metric('Vendor fixed cost', fmt_inr(data['total_cost']),
-                     sub='Aggregate across all vendors')],
-        [mini_metric('DD pairs in month', str(total_dd_pairs),
-                     sub=f'{total_dd_pairs*2} sites via double-install days'),
-         mini_metric('SD sites in month', str(total_sd_sites),
-                     sub='Single-install days')],
-    ]
-    for pair in grid_pairs:
-        row_t = Table([pair], colWidths=[CONTENT_W/2, CONTENT_W/2])
-        row_t.setStyle(TableStyle([
-            ('LEFTPADDING', (0,0), (-1,-1), 0),
-            ('RIGHTPADDING', (0,0), (-1,-1), 0),
-            ('VALIGN', (0,0), (-1,-1), 'TOP'),
-        ]))
-        story.append(row_t)
-        story.append(Spacer(1, 8 * mm))
+    row2 = Table([[
+        kpi('Total sites', str(total_sites), sub=f'Peak/BAU ratio {peak_to_bau:.2f}x'),
+        kpi('Total slippages', str(total_slips), sub=f'recovered across {n_days} days'),
+        kpi('Net profit', rs(data['total_profit']),
+            sub=f'{round(100*data["total_profit"]/data["total_payout"], 1) if data.get("total_payout") else 0}% margin',
+            accent=data['total_profit'] >= 0),
+    ]], colWidths=[CONTENT_W/3]*3)
+    row2.setStyle(TableStyle([('VALIGN', (0,0), (-1,-1), 'TOP'),
+                              ('LEFTPADDING', (0,0), (-1,-1), 0),
+                              ('RIGHTPADDING', (0,0), (-1,-1), 0)]))
+    story.append(row2)
 
     # ============================================================
-    # PROFIT DISTRIBUTION
+    # PAGE 2 — DEMAND PROFILE (end-of-month skew)
     # ============================================================
-    story.append(Spacer(1, 4 * mm))
-    story.append(P('Profit Distribution', font=SERIF, size=18, color=INK, leading=22))
+    story.append(PageBreak())
+    story.append(P('Demand Profile', font=SERIF, size=22, color=INK, leading=26))
     story.append(Spacer(1, 2 * mm))
-    story.append(P('Per-vendor profit by percentile within each pool.',
-                   font=SANS, size=10, color=SLATE))
-    story.append(Spacer(1, 6 * mm))
+    # Describe the stress + skew settings
+    pr = data.get('peak_ratio', 1.6)
+    sk = data.get('skew_pct', 100)
+    stress_label = 'P50 (typical)' if pr <= 1.45 else ('P75 (stressed)' if pr <= 1.55 else 'P90 (planning)')
+    if sk <= 5:
+        skew_label = 'flat distribution (every day equal)'
+    elif sk >= 95:
+        skew_label = 'full historical skew'
+    else:
+        skew_label = f'{int(sk)}% historical / {100-int(sk)}% flat blend'
+    story.append(P(
+        f'Stress level: <b>{stress_label}</b>. Skew: <b>{skew_label}</b>. '
+        f'Peak day: <b>D{peak_day+1}</b> with {max(daily)} sites. '
+        f'Average: {avg_daily:.1f} sites/day. Day 1: {daily[0]} sites.',
+        font=SANS, size=10, color=SLATE
+    ))
+    story.append(Spacer(1, 10 * mm))
 
-    profits_2i = [v['profit'] for v in data['vendors'] if v['type'] == '2-Install']
-    profits_1i = [v['profit'] for v in data['vendors'] if v['type'] == '1-Install']
-    avg_2i = sum(profits_2i) / len(profits_2i) if profits_2i else 0
-    avg_1i = sum(profits_1i) / len(profits_1i) if profits_1i else 0
+    # Bar chart - vertical bars with site counts BELOW
+    max_d = max(daily) if daily else 1
+    BAR_AREA_H = 55 * mm
+    bar_w = (CONTENT_W / n_days) - 0.5 * mm
 
-    def prof_cell(v):
-        if v is None:
-            return P('—', font=SANS, size=10, color=MUTED, align=TA_RIGHT)
-        c = POSITIVE if v >= 0 else NEGATIVE
-        return P(fmt_inr(v), font=SANS, size=10, color=c, align=TA_RIGHT)
+    def make_bar(value, is_peak):
+        h = max(1, int((value / max_d) * BAR_AREA_H))
+        col = ACCENT if is_peak else INK
+        return Table([['']], colWidths=[bar_w], rowHeights=[h],
+                     style=TableStyle([('BACKGROUND', (0,0), (-1,-1), col)]))
 
-    pct_rows = [[
-        P('', font=SANS_BOLD, size=8, color=MUTED),
-        P('2-INSTALL', font=SANS_BOLD, size=8, color=MUTED, align=TA_RIGHT),
-        P('1-INSTALL', font=SANS_BOLD, size=8, color=MUTED, align=TA_RIGHT),
-    ]]
-    for label, p in [('Min (P0)', 0), ('P25', 25), ('Median (P50)', 50),
-                     ('P75', 75), ('P90', 90), ('Max (P100)', 100)]:
-        pct_rows.append([
-            P(label, font=SANS, size=10, color=INK),
-            prof_cell(pct(profits_2i, p)),
-            prof_cell(pct(profits_1i, p)),
-        ])
-    pct_rows.append([
-        P('Average', font=SANS_BOLD, size=10, color=INK),
-        P(fmt_inr(avg_2i), font=SANS_BOLD, size=11, color=ACCENT, align=TA_RIGHT),
-        P(fmt_inr(avg_1i), font=SANS_BOLD, size=11, color=ACCENT, align=TA_RIGHT),
-    ])
-    pct_table = Table(pct_rows, colWidths=[CONTENT_W*0.4, CONTENT_W*0.3, CONTENT_W*0.3])
-    pct_table.setStyle(TableStyle([
-        # Header bottom rule
-        ('LINEBELOW', (0,0), (-1,0), 0.75, INK),
-        # Row separators
-        ('LINEBELOW', (0,1), (-1,-2), 0.25, HAIRLINE),
-        # Average row top rule
-        ('LINEABOVE', (0,-1), (-1,-1), 0.75, INK),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+    bar_cells = []
+    for i, v in enumerate(daily):
+        # Wrap each bar in a bottom-aligned cell
+        wrapper = Table([[make_bar(v, i == peak_day)]],
+                        colWidths=[CONTENT_W/n_days], rowHeights=[BAR_AREA_H + 2*mm],
+                        style=TableStyle([
+                            ('VALIGN', (0,0), (-1,-1), 'BOTTOM'),
+                            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                            ('LEFTPADDING', (0,0), (-1,-1), 0),
+                            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+                            ('TOPPADDING', (0,0), (-1,-1), 0),
+                            ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+                        ]))
+        bar_cells.append(wrapper)
+
+    bar_row = Table([bar_cells], colWidths=[CONTENT_W/n_days]*n_days)
+    bar_row.setStyle(TableStyle([
         ('LEFTPADDING', (0,0), (-1,-1), 0),
         ('RIGHTPADDING', (0,0), (-1,-1), 0),
-        ('TOPPADDING', (0,0), (-1,-1), 8),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+        ('TOPPADDING', (0,0), (-1,-1), 0),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+        ('VALIGN', (0,0), (-1,-1), 'BOTTOM'),
+        ('LINEBELOW', (0,0), (-1,-1), 0.75, INK),
     ]))
-    story.append(pct_table)
+    story.append(bar_row)
+
+    # NUMBER OF INSTALLS row directly under each bar
+    install_row = Table(
+        [[P(str(v), font=SANS_BOLD if i == peak_day else SANS,
+            size=6, color=ACCENT if i == peak_day else INK, align=TA_CENTER)
+          for i, v in enumerate(daily)]],
+        colWidths=[CONTENT_W/n_days]*n_days,
+        rowHeights=[4.5*mm],
+    )
+    install_row.setStyle(TableStyle([
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ('TOPPADDING', (0,0), (-1,-1), 1),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+    ]))
+    story.append(install_row)
+
+    # Day labels (every 5 days + peak + endpoints)
+    day_labels = []
+    for i in range(n_days):
+        show = (i + 1) % 5 == 0 or i == 0 or i == n_days - 1 or i == peak_day
+        day_labels.append(P(f'D{i+1}' if show else '',
+                            font=SANS, size=6,
+                            color=ACCENT if i == peak_day else MUTED,
+                            align=TA_CENTER))
+    label_row = Table([day_labels], colWidths=[CONTENT_W/n_days]*n_days, rowHeights=[4*mm])
+    label_row.setStyle(TableStyle([
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+    ]))
+    story.append(label_row)
+
+    # Demand summary stats
+    story.append(Spacer(1, 8 * mm))
+    stats = Table([
+        [P('TOTAL SITES', font=SANS_BOLD, size=7, color=MUTED),
+         P('PEAK DAY', font=SANS_BOLD, size=7, color=MUTED),
+         P('AVERAGE/DAY', font=SANS_BOLD, size=7, color=MUTED),
+         P('PEAK/BAU', font=SANS_BOLD, size=7, color=MUTED),
+         P('DD PAIRS', font=SANS_BOLD, size=7, color=MUTED),
+         P('SD SITES', font=SANS_BOLD, size=7, color=MUTED)],
+        [P(str(total_sites), font=SERIF, size=18, color=INK),
+         P(f'{max(daily)}', font=SERIF, size=18, color=ACCENT),
+         P(f'{avg_daily:.1f}', font=SERIF, size=18, color=INK),
+         P(f'{peak_to_bau:.2f}x', font=SERIF, size=18, color=INK),
+         P(str(total_dd_pairs), font=SERIF, size=18, color=INK),
+         P(str(total_sd_sites), font=SERIF, size=18, color=INK)],
+        [P('across month', font=SANS, size=7, color=SLATE),
+         P(f'on day {peak_day+1}', font=SANS, size=7, color=SLATE),
+         P('sites', font=SANS, size=7, color=SLATE),
+         P('ratio', font=SANS, size=7, color=SLATE),
+         P(f'= {total_dd_sites} sites', font=SANS, size=7, color=SLATE),
+         P('single days', font=SANS, size=7, color=SLATE)],
+    ], colWidths=[CONTENT_W/6]*6)
+    stats.setStyle(TableStyle([
+        ('LEFTPADDING', (0,0), (-1,-1), 4),
+        ('RIGHTPADDING', (0,0), (-1,-1), 4),
+        ('TOPPADDING', (0,0), (-1,-1), 4),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+        ('LINEABOVE', (0,0), (-1,0), 0.5, HAIRLINE),
+        ('LINEBELOW', (0,-1), (-1,-1), 0.5, HAIRLINE),
+    ]))
+    story.append(stats)
 
     # ============================================================
-    # PER-VENDOR P&L TABLE
+    # PAGE 3 — RATE CARDS & SSE SAVINGS DERIVATION
+    # ============================================================
+    story.append(PageBreak())
+    story.append(P('Rate Cards', font=SERIF, size=22, color=INK, leading=26))
+    story.append(Spacer(1, 2 * mm))
+    story.append(P(
+        f'Per-site payment rates by slab. 2-Install vendors receive a discounted rate '
+        f'on the second site in a double-install day (DD discount applied).',
+        font=SANS, size=10, color=SLATE
+    ))
+    story.append(Spacer(1, 8 * mm))
+
+    # Two side-by-side rate cards
+    # Pull rates from data if available, fall back to defaults
+    rates_2i = data.get('slab_rates_2i', [8000, 8500, 10000, 15000])
+    rates_1i = data.get('slab_rates_1i', rates_2i)  # if not provided, same as 2i
+
+    rate_header = [
+        P('SLAB', font=SANS_BOLD, size=7, color=PAPER),
+        P('2-INSTALL', font=SANS_BOLD, size=7, color=PAPER, align=TA_RIGHT),
+        P('1-INSTALL', font=SANS_BOLD, size=7, color=PAPER, align=TA_RIGHT),
+        P('DELTA', font=SANS_BOLD, size=7, color=PAPER, align=TA_RIGHT),
+    ]
+    rate_rows = [rate_header]
+    for i, label in enumerate(['S1', 'S2', 'S3', 'S4']):
+        r2 = rates_2i[i] if i < len(rates_2i) else 0
+        r1 = rates_1i[i] if i < len(rates_1i) else r2
+        delta = r1 - r2
+        delta_str = '—' if delta == 0 else (f'+{rs(delta)}' if delta > 0 else f'{rs(delta)}')
+        rate_rows.append([
+            P(label, font=SANS, size=10, color=INK),
+            P(rs_full(r2), font=SANS, size=10, color=INK, align=TA_RIGHT),
+            P(rs_full(r1), font=SANS, size=10, color=INK, align=TA_RIGHT),
+            P(delta_str, font=SANS, size=10, color=SLATE if delta == 0 else (POSITIVE if delta > 0 else NEGATIVE), align=TA_RIGHT),
+        ])
+    rate_table = Table(rate_rows, colWidths=[CONTENT_W*0.15, CONTENT_W*0.30, CONTENT_W*0.30, CONTENT_W*0.25])
+    rate_table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), ACCENT),
+        ('LINEBELOW', (0,1), (-1,-1), 0.25, HAIRLINE),
+        ('LINEABOVE', (0,1), (-1,1), 0.5, INK),
+        ('LEFTPADDING', (0,0), (-1,-1), 10),
+        ('RIGHTPADDING', (0,0), (-1,-1), 10),
+        ('TOPPADDING', (0,0), (-1,-1), 8),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+    ]))
+    story.append(rate_table)
+    story.append(Spacer(1, 4 * mm))
+    story.append(P('DD discount: second site in a pair pays 0.7x of its full slab rate.',
+                   font=SANS, size=8, color=MUTED))
+
+    # ---- SSE SAVINGS DERIVATION ----
+    story.append(Spacer(1, 14 * mm))
+    story.append(P('SSE Savings Derivation', font=SERIF, size=18, color=INK, leading=22))
+    story.append(Spacer(1, 4 * mm))
+
+    baseline_per_site = 10572
+    baseline_total = total_sites * baseline_per_site
+    modeled_total = data['total_payout']
+    savings_abs = baseline_total - modeled_total
+    savings_pct = (savings_abs / baseline_total * 100) if baseline_total else 0
+
+    deriv_rows = [
+        [P('Baseline payout', font=SANS, size=10, color=INK),
+         P(f'{total_sites} sites x Rs 10,572/site', font=SANS, size=9, color=SLATE),
+         P(rs_full(baseline_total), font=SANS, size=11, color=INK, align=TA_RIGHT)],
+        [P('Modelled payout', font=SANS, size=10, color=INK),
+         P('per optimised vendor plan', font=SANS, size=9, color=SLATE),
+         P(rs_full(modeled_total), font=SANS, size=11, color=INK, align=TA_RIGHT)],
+        [P('SSE Savings', font=SANS_BOLD, size=11, color=ACCENT),
+         P(f'{savings_pct:.1f}% reduction', font=SANS_BOLD, size=10, color=ACCENT),
+         P(rs_full(savings_abs), font=SANS_BOLD, size=13, color=ACCENT, align=TA_RIGHT)],
+    ]
+    deriv_table = Table(deriv_rows, colWidths=[CONTENT_W*0.30, CONTENT_W*0.40, CONTENT_W*0.30])
+    deriv_table.setStyle(TableStyle([
+        ('LINEABOVE', (0,0), (-1,0), 0.5, HAIRLINE),
+        ('LINEBELOW', (0,0), (-1,-2), 0.25, HAIRLINE),
+        ('LINEABOVE', (0,-1), (-1,-1), 1, ACCENT),
+        ('LINEBELOW', (0,-1), (-1,-1), 1, ACCENT),
+        ('LEFTPADDING', (0,0), (-1,-1), 10),
+        ('RIGHTPADDING', (0,0), (-1,-1), 10),
+        ('TOPPADDING', (0,0), (-1,-1), 10),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 10),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+    ]))
+    story.append(deriv_table)
+
+    # ============================================================
+    # PAGE 4 — VENDOR EARNINGS & PROFIT DISTRIBUTION
+    # ============================================================
+    story.append(PageBreak())
+    story.append(P('Vendor Earnings', font=SERIF, size=22, color=INK, leading=26))
+    story.append(Spacer(1, 2 * mm))
+    story.append(P(
+        f'Monthly profit per vendor (payout minus fixed cost), by percentile across the pool. '
+        f'P0 is the worst-paid vendor, P100 is the best.',
+        font=SANS, size=10, color=SLATE
+    ))
+    story.append(Spacer(1, 8 * mm))
+
+    def prof_cell(v):
+        if v is None: return P('—', font=SANS, size=10, color=MUTED, align=TA_RIGHT)
+        c = POSITIVE if v >= 0 else NEGATIVE
+        return P(rs(v), font=SANS, size=10, color=c, align=TA_RIGHT)
+
+    def pay_cell(v):
+        if v is None: return P('—', font=SANS, size=10, color=MUTED, align=TA_RIGHT)
+        return P(rs(v), font=SANS, size=10, color=INK, align=TA_RIGHT)
+
+    earnings_header = [
+        P('', font=SANS_BOLD, size=8, color=MUTED),
+        P('2-INSTALL\nPAYOUT', font=SANS_BOLD, size=7, color=MUTED, align=TA_RIGHT),
+        P('2-INSTALL\nPROFIT', font=SANS_BOLD, size=7, color=MUTED, align=TA_RIGHT),
+        P('1-INSTALL\nPAYOUT', font=SANS_BOLD, size=7, color=MUTED, align=TA_RIGHT),
+        P('1-INSTALL\nPROFIT', font=SANS_BOLD, size=7, color=MUTED, align=TA_RIGHT),
+    ]
+    earn_rows = [earnings_header]
+    for label, p in [('Min (P0)', 0), ('P25', 25), ('Median (P50)', 50),
+                     ('P75', 75), ('P90', 90), ('Max (P100)', 100)]:
+        earn_rows.append([
+            P(label, font=SANS, size=10, color=INK),
+            pay_cell(pct(payouts_2i, p)),
+            prof_cell(pct(profits_2i, p)),
+            pay_cell(pct(payouts_1i, p)),
+            prof_cell(pct(profits_1i, p)),
+        ])
+    earn_rows.append([
+        P('Average', font=SANS_BOLD, size=10, color=INK),
+        P(rs(avg_2i_payout), font=SANS_BOLD, size=11, color=INK, align=TA_RIGHT),
+        P(rs(avg_2i_profit), font=SANS_BOLD, size=11, color=ACCENT, align=TA_RIGHT),
+        P(rs(avg_1i_payout), font=SANS_BOLD, size=11, color=INK, align=TA_RIGHT),
+        P(rs(avg_1i_profit), font=SANS_BOLD, size=11, color=ACCENT, align=TA_RIGHT),
+    ])
+
+    earn_table = Table(earn_rows, colWidths=[CONTENT_W*0.24] + [CONTENT_W*0.19]*4)
+    earn_table.setStyle(TableStyle([
+        ('LINEBELOW', (0,0), (-1,0), 0.75, INK),
+        ('LINEBELOW', (0,1), (-1,-2), 0.25, HAIRLINE),
+        ('LINEABOVE', (0,-1), (-1,-1), 0.75, INK),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('LEFTPADDING', (0,0), (-1,-1), 4),
+        ('RIGHTPADDING', (0,0), (-1,-1), 4),
+        ('TOPPADDING', (0,0), (-1,-1), 9),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 9),
+    ]))
+    story.append(earn_table)
+
+    # Slippages box
+    story.append(Spacer(1, 12 * mm))
+    story.append(P('Slippages', font=SERIF, size=18, color=INK, leading=22))
+    story.append(Spacer(1, 4 * mm))
+    # Calculate 2i vs 1i slippages
+    # Slips from 2i sites (DD): 2 * sum(pair_count) * sl_rate_2i (we don't have rate directly here)
+    # We can approximate from total_slips and DD/SD site split
+    sl_share_2i_sites = total_dd_sites / (total_dd_sites + total_sd_sites) if (total_dd_sites + total_sd_sites) else 0
+    # If we don't have sl rates explicitly, approximate proportionally
+    # Better: pull from the data['daily'] if surfaced. For now, estimate
+    # Note: in practice slip rate on 2i and 1i could be different. We show the split if data has it.
+    slips_from_2i = data.get('slips_from_2i', round(total_slips * sl_share_2i_sites))
+    slips_from_1i = total_slips - slips_from_2i
+
+    slip_data = [
+        [P('SLIPS FROM 2-INSTALL', font=SANS_BOLD, size=7, color=MUTED),
+         P('SLIPS FROM 1-INSTALL', font=SANS_BOLD, size=7, color=MUTED),
+         P('TOTAL SLIPS', font=SANS_BOLD, size=7, color=MUTED)],
+        [P(str(slips_from_2i), font=SERIF, size=26, color=INK),
+         P(str(slips_from_1i), font=SERIF, size=26, color=INK),
+         P(str(total_slips), font=SERIF, size=26, color=ACCENT)],
+        [P(f'from {total_dd_sites} DD sites', font=SANS, size=8, color=SLATE),
+         P(f'from {total_sd_sites} SD sites', font=SANS, size=8, color=SLATE),
+         P('recovered across the month', font=SANS, size=8, color=SLATE)],
+    ]
+    slip_table = Table(slip_data, colWidths=[CONTENT_W/3]*3)
+    slip_table.setStyle(TableStyle([
+        ('LEFTPADDING', (0,0), (-1,-1), 4),
+        ('RIGHTPADDING', (0,0), (-1,-1), 4),
+        ('TOPPADDING', (0,0), (-1,-1), 4),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+        ('LINEABOVE', (0,0), (-1,0), 0.5, HAIRLINE),
+        ('LINEBELOW', (0,-1), (-1,-1), 0.5, HAIRLINE),
+    ]))
+    story.append(slip_table)
+
+    # ============================================================
+    # PAGE 5 — PER-VENDOR P&L
     # ============================================================
     story.append(PageBreak())
     story.append(P('Per-Vendor P&amp;L', font=SERIF, size=22, color=INK, leading=26))
     story.append(Spacer(1, 2 * mm))
-    story.append(P(f'Detailed financials for all {total_v} vendors.',
+    story.append(P(f'Detailed monthly economics for all {total_v} vendors.',
                    font=SANS, size=10, color=SLATE))
-    story.append(Spacer(1, 8 * mm))
+    story.append(Spacer(1, 6 * mm))
 
     header_row = [
         P('VENDOR', font=SANS_BOLD, size=7, color=MUTED),
@@ -1228,11 +1733,11 @@ def build_pdf_report(data, city_name):
             P(str(v['sl_days']), font=SANS, size=9, color=INK, align=TA_RIGHT),
             P(str(v['idle_days']), font=SANS, size=9, color=MUTED, align=TA_RIGHT),
             P(str(v['sites']), font=SANS, size=9, color=INK, align=TA_RIGHT),
-            P(fmt_inr(v['fixed_cost']), font=SANS, size=9, color=SLATE, align=TA_RIGHT),
-            P(fmt_inr(v['payout']), font=SANS, size=9, color=INK, align=TA_RIGHT),
-            P(fmt_inr(v['profit']), font=SANS_BOLD, size=10, color=c, align=TA_RIGHT),
+            P(rs(v['fixed_cost']), font=SANS, size=9, color=SLATE, align=TA_RIGHT),
+            P(rs(v['payout']), font=SANS, size=9, color=INK, align=TA_RIGHT),
+            P(rs(v['profit']), font=SANS_BOLD, size=10, color=c, align=TA_RIGHT),
         ])
-    # Totals
+    # Totals row
     tot_dd = sum(v['dd_days'] for v in data['vendors'])
     tot_sd = sum(v['sd_sites'] for v in data['vendors'])
     tot_sl = sum(v['sl_days'] for v in data['vendors'])
@@ -1246,13 +1751,13 @@ def build_pdf_report(data, city_name):
         P(str(tot_sl), font=SANS_BOLD, size=10, color=INK, align=TA_RIGHT),
         P(str(tot_idle), font=SANS_BOLD, size=10, color=MUTED, align=TA_RIGHT),
         P(str(tot_sites), font=SANS_BOLD, size=10, color=INK, align=TA_RIGHT),
-        P(fmt_inr(data['total_cost']), font=SANS_BOLD, size=10, color=INK, align=TA_RIGHT),
-        P(fmt_inr(data['total_payout']), font=SANS_BOLD, size=10, color=INK, align=TA_RIGHT),
-        P(fmt_inr(data['total_profit']), font=SANS_BOLD, size=11,
+        P(rs(data['total_cost']), font=SANS_BOLD, size=10, color=INK, align=TA_RIGHT),
+        P(rs(data['total_payout']), font=SANS_BOLD, size=10, color=INK, align=TA_RIGHT),
+        P(rs(data['total_profit']), font=SANS_BOLD, size=11,
           color=POSITIVE if data['total_profit'] >= 0 else NEGATIVE, align=TA_RIGHT),
     ])
 
-    col_widths = [16, 18, 8, 8, 8, 9, 11, 22, 25, 28]
+    col_widths = [16, 17, 8, 8, 8, 9, 11, 22, 25, 28]
     total_units = sum(col_widths)
     col_widths = [w / total_units * CONTENT_W for w in col_widths]
 
@@ -1264,179 +1769,97 @@ def build_pdf_report(data, city_name):
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
         ('LEFTPADDING', (0,0), (-1,-1), 4),
         ('RIGHTPADDING', (0,0), (-1,-1), 4),
-        ('TOPPADDING', (0,0), (-1,-1), 6),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+        ('TOPPADDING', (0,0), (-1,-1), 5),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
     ]))
     story.append(pnl_table)
 
-    story.append(Spacer(1, 6 * mm))
+    story.append(Spacer(1, 4 * mm))
     story.append(P(
-        'DD = double install day · SD = single install day · SL = slip recovery. '
-        'Profit = Payout − Fixed monthly cost.',
+        'DD = double install day (2 sites). SD = single install day. SL = slip recovery. '
+        'Profit = Payout - Fixed cost.',
         font=SANS, size=8, color=MUTED
     ))
 
     # ============================================================
-    # DEMAND PROFILE
+    # PAGE 6 — INSTALL CALENDAR (end-of-month skew visible)
     # ============================================================
     story.append(PageBreak())
-    story.append(P('Demand Profile', font=SERIF, size=22, color=INK, leading=26))
+    story.append(P('Install Calendar', font=SERIF, size=22, color=INK, leading=26))
     story.append(Spacer(1, 2 * mm))
-    story.append(P(f'Sites per day across the {len(data["daily"])}-day month. Peak occurs on day {data["peak_day"]+1}.',
-                   font=SANS, size=10, color=SLATE))
-    story.append(Spacer(1, 10 * mm))
-
-    daily = data['daily']
-    peak_day = data['peak_day']
-    max_d = max(daily) if daily else 1
-    n_days = len(daily)
-
-    # Minimal bar chart: thin vertical lines, peak in accent
-    # Build a single-row table where each cell is a vertical bar via height
-    BAR_AREA_H = 50 * mm
-    bar_cells = []
-    for i, v in enumerate(daily):
-        h = max(1, int((v / max_d) * BAR_AREA_H))
-        col = ACCENT if i == peak_day else INK
-        # Use a thin Table inner box
-        bar_cells.append([Table([['']], colWidths=[(CONTENT_W / n_days) - 0.5*mm],
-                                rowHeights=[h * 1.0],
-                                style=TableStyle([('BACKGROUND', (0,0), (-1,-1), col)]))])
-    # We'll render bars as a single row of bottom-aligned mini tables
-    bar_row = Table([bar_cells[i*n_days:(i+1)*n_days] for i in range(0, 1)]
-                    if False else [[Table([[
-                        Table([['']], colWidths=[(CONTENT_W/n_days) - 0.5*mm],
-                              rowHeights=[max(1, int((v/max_d)*BAR_AREA_H))],
-                              style=TableStyle([('BACKGROUND', (0,0), (-1,-1), ACCENT if i==peak_day else INK)]))
-                    ]], colWidths=[(CONTENT_W/n_days)], rowHeights=[BAR_AREA_H + 2*mm],
-                    style=TableStyle([('VALIGN', (0,0), (-1,-1), 'BOTTOM'),
-                                      ('LEFTPADDING', (0,0), (-1,-1), 0),
-                                      ('RIGHTPADDING', (0,0), (-1,-1), 0),
-                                      ('TOPPADDING', (0,0), (-1,-1), 0),
-                                      ('BOTTOMPADDING', (0,0), (-1,-1), 0)]))
-                    for i, v in enumerate(daily)]],
-                    colWidths=[CONTENT_W/n_days] * n_days)
-    bar_row.setStyle(TableStyle([
-        ('LEFTPADDING', (0,0), (-1,-1), 0),
-        ('RIGHTPADDING', (0,0), (-1,-1), 0),
-        ('TOPPADDING', (0,0), (-1,-1), 0),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 0),
-        ('VALIGN', (0,0), (-1,-1), 'BOTTOM'),
-        ('LINEBELOW', (0,0), (-1,-1), 0.5, INK),
-    ]))
-    story.append(bar_row)
-
-    # Day number labels under bars
-    day_labels = [P(str(i+1) if (i+1) % 5 == 0 or i == 0 or i == n_days-1 or i == peak_day else '',
-                    font=SANS, size=7,
-                    color=ACCENT if i == peak_day else MUTED,
-                    align=TA_CENTER) for i in range(n_days)]
-    label_row = Table([day_labels], colWidths=[CONTENT_W/n_days]*n_days, rowHeights=[5*mm])
-    label_row.setStyle(TableStyle([
-        ('LEFTPADDING', (0,0), (-1,-1), 0),
-        ('RIGHTPADDING', (0,0), (-1,-1), 0),
-        ('VALIGN', (0,0), (-1,-1), 'TOP'),
-    ]))
-    story.append(label_row)
-
-    story.append(Spacer(1, 8 * mm))
-    # Stats inline
-    stats_tbl = Table([[
-        P(f'<font name="{SANS_BOLD}" size="9" color="#9aa0a8">PEAK</font><br/>'
-          f'<font name="{SERIF}" size="20" color="#131ac3">{max(daily)}</font><br/>'
-          f'<font name="{SANS}" size="8" color="#5e6470">sites · day {peak_day+1}</font>',
-          font=SANS, size=9, leading=12),
-        P(f'<font name="{SANS_BOLD}" size="9" color="#9aa0a8">AVERAGE</font><br/>'
-          f'<font name="{SERIF}" size="20" color="#0f1419">{avg_daily:.1f}</font><br/>'
-          f'<font name="{SANS}" size="8" color="#5e6470">sites/day</font>',
-          font=SANS, size=9, leading=12),
-        P(f'<font name="{SANS_BOLD}" size="9" color="#9aa0a8">PEAK/AVG</font><br/>'
-          f'<font name="{SERIF}" size="20" color="#0f1419">{peak_to_avg:.2f}×</font><br/>'
-          f'<font name="{SANS}" size="8" color="#5e6470">ratio</font>',
-          font=SANS, size=9, leading=12),
-        P(f'<font name="{SANS_BOLD}" size="9" color="#9aa0a8">MONTH TOTAL</font><br/>'
-          f'<font name="{SERIF}" size="20" color="#0f1419">{sum(daily)}</font><br/>'
-          f'<font name="{SANS}" size="8" color="#5e6470">sites</font>',
-          font=SANS, size=9, leading=12),
-    ]], colWidths=[CONTENT_W/4]*4)
-    stats_tbl.setStyle(TableStyle([
-        ('LEFTPADDING', (0,0), (-1,-1), 0),
-        ('RIGHTPADDING', (0,0), (-1,-1), 0),
-        ('VALIGN', (0,0), (-1,-1), 'TOP'),
-    ]))
-    story.append(stats_tbl)
-
-    # ============================================================
-    # ROSTER CALENDAR — minimal: single letter per cell, no fills
-    # ============================================================
-    story.append(PageBreak())
-    story.append(P('Roster Calendar', font=SERIF, size=22, color=INK, leading=26))
-    story.append(Spacer(1, 2 * mm))
-    story.append(P('D = double install · S = single install · s = slip recovery · · = rest day',
-                   font=SANS, size=10, color=SLATE))
-    story.append(Spacer(1, 8 * mm))
+    story.append(P(
+        f'Daily roster across all {total_v} vendors. '
+        f'D = double install, S = single install, s = slip recovery, dot = rest. '
+        f'Peak day (D{peak_day+1}) highlighted in blue.',
+        font=SANS, size=10, color=SLATE
+    ))
+    story.append(Spacer(1, 6 * mm))
 
     roster = data['roster']
     n_vendors = len(roster)
-    days = len(daily)
 
-    # Header
-    cal_header = [P('', font=SANS, size=7)]
+    cal_header = [P('DAY', font=SANS_BOLD, size=7, color=PAPER, align=TA_LEFT)]
+    cal_header.append(P('SITES', font=SANS_BOLD, size=7, color=PAPER, align=TA_RIGHT))
     for v in data['vendors']:
-        cal_header.append(P(v['name'], font=SANS_BOLD, size=6, color=MUTED, align=TA_CENTER))
+        cal_header.append(P(v['name'], font=SANS_BOLD, size=6, color=PAPER, align=TA_CENTER))
     cal_rows = [cal_header]
 
-    for d in range(days):
-        row = [P(f'D{d+1}', font=SANS_BOLD if d == peak_day else SANS,
-                 size=7, color=ACCENT if d == peak_day else SLATE, align=TA_LEFT)]
+    for d in range(n_days):
+        is_peak = (d == peak_day)
+        row = [
+            P(f'D{d+1}', font=SANS_BOLD if is_peak else SANS,
+              size=7, color=ACCENT if is_peak else SLATE),
+            P(str(daily[d]), font=SANS_BOLD if is_peak else SANS,
+              size=7, color=ACCENT if is_peak else INK, align=TA_RIGHT),
+        ]
         for vi in range(n_vendors):
             cell = roster[vi][d]
             kind = cell.get('type', 'idle')
             if kind == 'DD':
-                # Bold uppercase D
-                row.append(P('D', font=SANS_BOLD, size=9, color=ACCENT, align=TA_CENTER))
+                row.append(P('D', font=SANS_BOLD, size=8, color=ACCENT, align=TA_CENTER))
             elif kind == 'SD':
-                row.append(P('S', font=SANS, size=9, color=INK, align=TA_CENTER))
+                row.append(P('S', font=SANS, size=8, color=INK, align=TA_CENTER))
             elif kind == 'SL':
-                row.append(P('s', font=SANS_BOLD, size=9, color=NEGATIVE, align=TA_CENTER))
+                row.append(P('s', font=SANS_BOLD, size=8, color=NEGATIVE, align=TA_CENTER))
             else:
-                row.append(P('·', font=SANS, size=9, color=MUTED, align=TA_CENTER))
+                row.append(P('·', font=SANS, size=8, color=MUTED, align=TA_CENTER))
         cal_rows.append(row)
 
-    day_col = 11 * mm
-    vendor_col = (CONTENT_W - day_col) / max(1, n_vendors)
-    col_widths_cal = [day_col] + [vendor_col] * n_vendors
+    day_col = 9 * mm
+    sites_col = 11 * mm
+    vendor_col = (CONTENT_W - day_col - sites_col) / max(1, n_vendors)
+    col_widths_cal = [day_col, sites_col] + [vendor_col] * n_vendors
 
     cal_table = Table(cal_rows, colWidths=col_widths_cal, repeatRows=1)
     cstyle = [
-        ('LINEBELOW', (0,0), (-1,0), 0.75, INK),
+        ('BACKGROUND', (0,0), (-1,0), ACCENT),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('LEFTPADDING', (0,0), (-1,-1), 1),
-        ('RIGHTPADDING', (0,0), (-1,-1), 1),
+        ('LEFTPADDING', (0,0), (-1,-1), 2),
+        ('RIGHTPADDING', (0,0), (-1,-1), 2),
         ('TOPPADDING', (0,0), (-1,-1), 3),
         ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ('LINEBELOW', (0,0), (-1,0), 0.5, ACCENT),
         ('LINEBELOW', (0,1), (-1,-1), 0.15, HAIRLINE),
+        # Highlight peak row left rail
+        ('BACKGROUND', (0, peak_day+1), (1, peak_day+1), colors.HexColor('#eef0ff')),
     ]
     cal_table.setStyle(TableStyle(cstyle))
     story.append(cal_table)
 
-    # ---- Page decoration ----
+    # ---- Page footer decoration ----
     def add_page_decoration(canvas, doc_):
         canvas.saveState()
-        # Top thin accent line
         canvas.setStrokeColor(ACCENT)
         canvas.setLineWidth(1.5)
-        canvas.line(MARGIN, PAGE_H - 14*mm, MARGIN + 30*mm, PAGE_H - 14*mm)
-        # Footer thin hairline
+        canvas.line(MARGIN, PAGE_H - 12*mm, MARGIN + 28*mm, PAGE_H - 12*mm)
         canvas.setStrokeColor(HAIRLINE)
         canvas.setLineWidth(0.3)
-        canvas.line(MARGIN, 16*mm, PAGE_W - MARGIN, 16*mm)
-        # Footer text
+        canvas.line(MARGIN, 14*mm, PAGE_W - MARGIN, 14*mm)
         canvas.setFont(SANS, 7)
         canvas.setFillColor(MUTED)
-        canvas.drawString(MARGIN, 11*mm, f'SolarSquare Vendor Plan')
-        canvas.drawCentredString(PAGE_W/2, 11*mm, city_name)
-        canvas.drawRightString(PAGE_W - MARGIN, 11*mm, f'{doc_.page} · {date_str}')
+        canvas.drawString(MARGIN, 10*mm, 'SolarSquare Vendor Plan')
+        canvas.drawCentredString(PAGE_W/2, 10*mm, city_name)
+        canvas.drawRightString(PAGE_W - MARGIN, 10*mm, f'{doc_.page}  ·  {date_str}')
         canvas.restoreState()
 
     doc.build(story, onFirstPage=add_page_decoration, onLaterPages=add_page_decoration)
@@ -1477,6 +1900,285 @@ def index():
 @app.route('/health')
 def health():
     return jsonify({'ortools_loaded': ORTOOLS_OK, 'ortools_error': ORTOOLS_ERR})
+
+
+@app.route('/clusters')
+def clusters_route():
+    """Return cluster catalog for the UI dropdown."""
+    catalog = []
+    for name, info in sorted(CLUSTER_DATA.items()):
+        catalog.append({
+            'name': name,
+            'avg_monthly': info['avg_monthly'],
+            'april_2026': info.get('april_2026', info['avg_monthly']),
+            'pan_india_skew': info.get('pan_india_skew', 70),
+            'total_12mo': info['total_12mo'],
+            'months_used': info['months_used'],
+            'slab_mix': info['slab_mix'],
+            'is_noisy': info['months_used'] <= 2,
+        })
+    return jsonify({'clusters': catalog})
+
+
+# ============================================================================
+# PAN-INDIA PRECOMPUTE & CACHE
+# ============================================================================
+# Runs solver for every cluster at startup, caches results.
+# All clusters use: P75 demand, cluster-specific skew (60/70/80 by data quality),
+# April 2026 volume, fixed slip rates (2i=10%, 1i=20%), default slab rates.
+# Cache is in-memory; cleared on app restart.
+PAN_INDIA_CACHE = {
+    'status': 'not_started',  # 'not_started', 'computing', 'ready', 'error'
+    'progress': 0,             # 0-100
+    'current_cluster': None,
+    'results': [],             # list of per-cluster result dicts
+    'started_at': None,
+    'completed_at': None,
+}
+
+# Default inputs for pan-India runs (cluster-independent)
+PAN_INDIA_DEFAULTS = {
+    'days': 30,
+    'peak_ratio': 1.5,           # P75 (between 1.45 and 1.55)
+    'sl2_rate': 0.10,             # 2i slip rate (upper bound of 5-10%)
+    'sl1_rate': 0.20,             # 1i slip rate (upper bound of 10-30%)
+    'elig_pct': 0.50,             # 2i eligibility
+    'target_pxx': 0.75,
+    'slab_rates': [8000, 8500, 10000, 15000],
+    'slab_rates_1i': [8000, 8500, 10000, 15000],
+    'dd_elig_slabs': [True, True, False, False],
+    'cost_2i': 180000,
+    'cost_1i': 140000,
+    'dd_discount': 0.7,
+    'baseline_per_site': 10572,
+    'time_limit_sec': 30,
+    'max_working_days': 26,
+}
+
+
+def compute_pan_india_for_cluster(cluster_name):
+    """Run the solver for one cluster with pan-India defaults."""
+    info = CLUSTER_DATA[cluster_name]
+    volume = info.get('april_2026', info['avg_monthly'])
+    if volume < 30:
+        print(f'[pan-india/{cluster_name}] SKIPPED: only {volume} installs in April')
+        return {
+            'cluster': cluster_name,
+            'status': 'skipped_low_volume',
+            'reason': f'Only {volume} installs in April — too low for stable solve',
+            'volume': volume,
+        }
+
+    params = dict(PAN_INDIA_DEFAULTS)
+    params['total_sites'] = volume
+    params['cluster'] = cluster_name
+    params['skew_pct'] = info.get('pan_india_skew', 70)
+    # Use cluster's actual slab mix
+    params['slab_mix'] = info['slab_mix']
+
+    # Detailed pre-solve log so you can verify inputs
+    print(f'\n[pan-india/{cluster_name}] ============================================')
+    print(f'[pan-india/{cluster_name}] INPUT PARAMS:')
+    print(f'[pan-india/{cluster_name}]   total_sites:    {params["total_sites"]} (April 2026)')
+    print(f'[pan-india/{cluster_name}]   days:           {params["days"]}')
+    print(f'[pan-india/{cluster_name}]   peak_ratio:     {params["peak_ratio"]} (P75)')
+    print(f'[pan-india/{cluster_name}]   skew_pct:       {params["skew_pct"]}% (data quality: {info["months_used"]} months)')
+    print(f'[pan-india/{cluster_name}]   slab_mix:       S1={params["slab_mix"][0]} S2={params["slab_mix"][1]} S3={params["slab_mix"][2]} S4={params["slab_mix"][3]}')
+    print(f'[pan-india/{cluster_name}]   slab_rates_2i:  {params["slab_rates"]}')
+    print(f'[pan-india/{cluster_name}]   slab_rates_1i:  {params["slab_rates_1i"]}')
+    print(f'[pan-india/{cluster_name}]   dd_elig_slabs:  S1={params["dd_elig_slabs"][0]} S2={params["dd_elig_slabs"][1]} S3={params["dd_elig_slabs"][2]} S4={params["dd_elig_slabs"][3]}')
+    print(f'[pan-india/{cluster_name}]   elig_pct:       {params["elig_pct"]*100}%')
+    print(f'[pan-india/{cluster_name}]   sl2_rate:       {params["sl2_rate"]*100}%  (2i slip)')
+    print(f'[pan-india/{cluster_name}]   sl1_rate:       {params["sl1_rate"]*100}%  (1i slip)')
+    print(f'[pan-india/{cluster_name}]   cost_2i:        Rs {params["cost_2i"]:,.0f}')
+    print(f'[pan-india/{cluster_name}]   cost_1i:        Rs {params["cost_1i"]:,.0f}')
+    print(f'[pan-india/{cluster_name}]   dd_discount:    {params["dd_discount"]}')
+    print(f'[pan-india/{cluster_name}]   baseline/site:  Rs {params["baseline_per_site"]:,.0f}')
+    print(f'[pan-india/{cluster_name}]   max_work_days:  {params["max_working_days"]}')
+
+    import time as _time
+    t_start = _time.time()
+    try:
+        result = run_solver(params)
+        elapsed = _time.time() - t_start
+        if result is None or result.get('_diagnostic_only'):
+            print(f'[pan-india/{cluster_name}] INFEASIBLE after {elapsed:.1f}s')
+            return {
+                'cluster': cluster_name,
+                'status': 'infeasible',
+                'volume': volume,
+                'skew': params['skew_pct'],
+            }
+        # Extract just what we need for the pan-India table
+        vendors = result.get('vendors', [])
+        v2 = result.get('v2', 0)
+        v1 = result.get('v1', 0)
+        # Profit distributions
+        profits_2i = sorted([v['profit'] for v in vendors if v['type'] == '2-Install'])
+        profits_1i = sorted([v['profit'] for v in vendors if v['type'] == '1-Install'])
+        def pxx(arr, p):
+            if not arr:
+                return 0
+            idx = (p / 100) * (len(arr) - 1)
+            lo = int(idx); hi = min(lo+1, len(arr)-1)
+            frac = idx - lo
+            return arr[lo] + (arr[hi] - arr[lo]) * frac
+        dist_2i = {f'P{p}': round(pxx(profits_2i, p)) for p in [0, 25, 50, 75, 90, 100]}
+        dist_1i = {f'P{p}': round(pxx(profits_1i, p)) for p in [0, 25, 50, 75, 90, 100]}
+        avg_2i = round(sum(profits_2i) / len(profits_2i)) if profits_2i else 0
+        avg_1i = round(sum(profits_1i) / len(profits_1i)) if profits_1i else 0
+        # Compute SSE savings
+        total_payout = result.get('total_payout', 0)
+        baseline_total = volume * PAN_INDIA_DEFAULTS['baseline_per_site']
+        savings = baseline_total - total_payout
+        savings_pct = (savings / baseline_total * 100) if baseline_total > 0 else 0
+
+        # Detailed result log
+        print(f'[pan-india/{cluster_name}] RESULT after {elapsed:.1f}s:')
+        print(f'[pan-india/{cluster_name}]   Vendors:        {v2} (2i) + {v1} (1i) = {v2+v1} total')
+        print(f'[pan-india/{cluster_name}]   Modelled cost:  Rs {total_payout:,.0f}')
+        print(f'[pan-india/{cluster_name}]   Baseline cost:  Rs {baseline_total:,.0f}')
+        print(f'[pan-india/{cluster_name}]   Savings:        Rs {savings:,.0f} ({savings_pct:.1f}%)')
+        if profits_2i:
+            print(f'[pan-india/{cluster_name}]   2i profits:     min=Rs {min(profits_2i):,.0f} median=Rs {profits_2i[len(profits_2i)//2]:,.0f} max=Rs {max(profits_2i):,.0f}')
+        if profits_1i:
+            print(f'[pan-india/{cluster_name}]   1i profits:     min=Rs {min(profits_1i):,.0f} median=Rs {profits_1i[len(profits_1i)//2]:,.0f} max=Rs {max(profits_1i):,.0f}')
+
+        # Sanity: profitability check
+        unprofitable_vendors = [(v['name'], v['profit']) for v in vendors if v['profit'] < 0]
+        unprofitable_amount = sum(-p for _, p in unprofitable_vendors)
+        all_profitable = len(unprofitable_vendors) == 0
+        if not all_profitable:
+            print(f'[pan-india/{cluster_name}]   ⚠ UNPROFITABLE VENDORS: {unprofitable_vendors}')
+            print(f'[pan-india/{cluster_name}]   ⚠ Total loss: Rs {unprofitable_amount:,.0f}')
+
+        # Sanity: total payout matches sum of vendor payouts
+        sum_vendor_payouts = sum(v['payout'] for v in vendors)
+        if abs(sum_vendor_payouts - total_payout) > 1:
+            print(f'[pan-india/{cluster_name}]   ⚠ PAYOUT MISMATCH: result={total_payout} vs sum(vendor.payout)={sum_vendor_payouts}')
+
+        # Determine final status:
+        # - 'ok' only if ALL vendors are profitable
+        # - 'partial' if some vendors lose money (solver returned a degraded solution)
+        final_status = 'ok' if all_profitable else 'partial'
+        if not all_profitable:
+            print(f'[pan-india/{cluster_name}] STATUS: PARTIAL (some vendors unprofitable — solution not viable)')
+
+        return {
+            'cluster': cluster_name,
+            'status': final_status,
+            'volume': volume,
+            'skew': params['skew_pct'],
+            'v2': v2,
+            'v1': v1,
+            'total_v': v2 + v1,
+            'total_payout': round(total_payout),
+            'baseline_cost': round(baseline_total),
+            'savings_rs': round(savings),
+            'savings_pct': round(savings_pct, 1),
+            'dist_2i': dist_2i,
+            'dist_1i': dist_1i,
+            'avg_2i': avg_2i,
+            'avg_1i': avg_1i,
+            'months_used': info['months_used'],
+            'slab_mix': info['slab_mix'],
+            'is_noisy': info['months_used'] <= 2,
+            'elapsed_sec': round(elapsed, 2),
+            'all_profitable': all_profitable,
+            'unprofitable_count': len(unprofitable_vendors),
+            'unprofitable_amount': round(unprofitable_amount),
+        }
+    except Exception as e:
+        elapsed = _time.time() - t_start
+        print(f'[pan-india/{cluster_name}] ERROR after {elapsed:.1f}s: {e}')
+        import traceback
+        traceback.print_exc()
+        return {
+            'cluster': cluster_name,
+            'status': 'error',
+            'error': str(e)[:200],
+            'volume': volume,
+        }
+
+
+def compute_pan_india_all():
+    """Run all clusters. Called at startup in a background thread."""
+    global PAN_INDIA_CACHE
+    PAN_INDIA_CACHE['status'] = 'computing'
+    PAN_INDIA_CACHE['started_at'] = datetime.datetime.now().isoformat()
+    PAN_INDIA_CACHE['results'] = []
+    PAN_INDIA_CACHE['progress'] = 0
+    cluster_names = sorted(CLUSTER_DATA.keys())
+    n = len(cluster_names)
+    for idx, name in enumerate(cluster_names):
+        PAN_INDIA_CACHE['current_cluster'] = name
+        print(f'[pan-india] [{idx+1}/{n}] Solving {name}...')
+        res = compute_pan_india_for_cluster(name)
+        PAN_INDIA_CACHE['results'].append(res)
+        PAN_INDIA_CACHE['progress'] = round((idx + 1) / n * 100)
+        print(f'[pan-india] [{idx+1}/{n}] {name}: {res.get("status")} '
+              f'(v={res.get("total_v", "-")}, savings={res.get("savings_pct", "-")}%)')
+    PAN_INDIA_CACHE['status'] = 'ready'
+    PAN_INDIA_CACHE['current_cluster'] = None
+    PAN_INDIA_CACHE['completed_at'] = datetime.datetime.now().isoformat()
+    # Compute totals
+    # Only 'ok' clusters count toward the headline savings number (partial clusters
+    # have unprofitable vendors and aren't real solutions).
+    ok = [r for r in PAN_INDIA_CACHE['results'] if r['status'] == 'ok']
+    partial = [r for r in PAN_INDIA_CACHE['results'] if r['status'] == 'partial']
+    infeasible = [r for r in PAN_INDIA_CACHE['results'] if r['status'] == 'infeasible']
+    skipped = [r for r in PAN_INDIA_CACHE['results'] if r['status'] == 'skipped_low_volume']
+    errored = [r for r in PAN_INDIA_CACHE['results'] if r['status'] == 'error']
+
+    total_vendors = sum(r['total_v'] for r in ok)
+    total_volume = sum(r['volume'] for r in ok)
+    total_payout = sum(r['total_payout'] for r in ok)
+    total_baseline = sum(r['baseline_cost'] for r in ok)
+    savings_pct = ((total_baseline - total_payout) / total_baseline * 100) if total_baseline > 0 else 0
+
+    # Also compute "with partial" totals so the UI can show the full picture
+    ok_and_partial = ok + partial
+    total_vendors_with_partial = sum(r['total_v'] for r in ok_and_partial)
+    total_volume_with_partial = sum(r['volume'] for r in ok_and_partial)
+    total_unprofitable = sum(r.get('unprofitable_amount', 0) for r in partial)
+
+    PAN_INDIA_CACHE['totals'] = {
+        'clusters_ok': len(ok),
+        'clusters_partial': len(partial),
+        'clusters_infeasible': len(infeasible),
+        'clusters_skipped': len(skipped),
+        'clusters_error': len(errored),
+        'clusters_total': n,
+        'total_vendors': total_vendors,
+        'total_vendors_with_partial': total_vendors_with_partial,
+        'total_volume': total_volume,
+        'total_volume_with_partial': total_volume_with_partial,
+        'total_payout': round(total_payout),
+        'total_baseline': round(total_baseline),
+        'total_savings_rs': round(total_baseline - total_payout),
+        'total_savings_pct': round(savings_pct, 1),
+        'total_unprofitable_amount': round(total_unprofitable),
+    }
+    print(f'[pan-india] DONE. {len(ok)}/{n} fully solved, {len(partial)} partial, '
+          f'{len(infeasible)} infeasible, {len(skipped)} skipped, {len(errored)} errored. '
+          f'Headline: {total_vendors} vendors, {savings_pct:.1f}% SSE savings.')
+
+
+@app.route('/pan_india')
+def pan_india_route():
+    """Return cached pan-India results."""
+    return jsonify(PAN_INDIA_CACHE)
+
+
+@app.route('/pan_india/refresh', methods=['POST'])
+def pan_india_refresh_route():
+    """Trigger a recompute (in background)."""
+    import threading
+    if PAN_INDIA_CACHE['status'] == 'computing':
+        return jsonify({'ok': False, 'reason': 'Already computing'}), 200
+    t = threading.Thread(target=compute_pan_india_all, daemon=True)
+    t.start()
+    return jsonify({'ok': True, 'message': 'Pan-India compute started in background'})
 
 
 @app.route('/solve', methods=['POST'])
@@ -1522,5 +2224,13 @@ if __name__ == '__main__':
         print(f'  Error: {ORTOOLS_ERR}')
     print('Open http://localhost:5000 in browser')
     print('=' * 60)
+
+    # Auto-trigger pan-India compute in background so cache is warm for demos
+    if ORTOOLS_OK and os.environ.get('SKIP_PAN_INDIA') != '1':
+        import threading
+        print('[startup] Launching pan-India precompute in background...')
+        print('[startup] (Set SKIP_PAN_INDIA=1 env to skip this)')
+        threading.Thread(target=compute_pan_india_all, daemon=True).start()
+
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
