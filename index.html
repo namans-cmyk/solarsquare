@@ -75,7 +75,9 @@
   <div>
     <div class="panel">
       <h3>Sliders</h3>
-      <label class="field"><div class="row"><span>Peak to BAU ratio</span><span id="r-peak">1.3</span></div><input type="range" id="s-peak" min="1" max="2" step="0.1" value="1.3"></label>
+      <label class="field"><div class="row"><span>Cluster</span><span id="r-cluster-info" style="font-size: 10px; color: var(--text-faint);"></span></div><select id="s-cluster" style="width: 100%; padding: 6px; font-size: 13px; border: 1px solid var(--border); border-radius: 4px; background: white;"></select></label>
+      <label class="field"><div class="row"><span>Demand stress (P50/P75/P90)</span><span id="r-peak">P90</span></div><input type="range" id="s-peak" min="1.3" max="1.7" step="0.05" value="1.6"></label>
+      <label class="field"><div class="row"><span>Skew vs flat</span><span id="r-skew">100% (historical)</span></div><input type="range" id="s-skew" min="0" max="100" step="5" value="100"></label>
       <label class="field"><div class="row"><span>Slip % on 2-install sites</span><span id="r-sl2">10%</span></div><input type="range" id="s-sl2" min="0" max="100" step="1" value="10"></label>
       <label class="field"><div class="row"><span>Slip % on 1-install sites</span><span id="r-sl1">20%</span></div><input type="range" id="s-sl1" min="0" max="100" step="1" value="20"></label>
       <label class="field"><div class="row"><span>2i eligibility % (daily)</span><span id="r-elig">40%</span></div><input type="range" id="s-elig" min="20" max="100" step="1" value="40"></label>
@@ -111,6 +113,11 @@
 
       <button class="solve" id="solve-btn">Run CP-SAT solver</button>
 
+      <div style="margin-top: 8px;">
+        <button class="solve" id="pan-india-btn" style="background: #6b46c1; width: 100%;">Pan-India view</button>
+        <div id="pan-india-status" style="font-size: 10px; color: var(--text-faint); margin-top: 4px; text-align: center;">Cache: not started</div>
+      </div>
+
       <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);">
         <label class="field" style="margin:0 0 6px 0;"><div class="row"><span>City name (for PDF report)</span></div><input type="text" id="a-city" placeholder="e.g. Mumbai" value=""></label>
         <button class="solve" id="report-btn" disabled style="background: #131ac3;">Generate PDF Report</button>
@@ -121,6 +128,18 @@
   <div>
     <div id="status" class="status">Click "Run CP-SAT solver" to start. Solving takes ~75 seconds.</div>
 
+    <div id="pan-india-view" style="display:none; background: white; border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+        <h3 style="margin: 0; font-size: 18px;">Pan-India view</h3>
+        <div>
+          <button id="pan-india-refresh" style="background: #f5f5f7; border: 1px solid var(--border); padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer;">Refresh cache</button>
+          <button id="pan-india-close" style="background: #f5f5f7; border: 1px solid var(--border); padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; margin-left: 4px;">Close</button>
+        </div>
+      </div>
+      <div id="pan-india-totals" style="margin-bottom: 16px;"></div>
+      <div id="pan-india-table"></div>
+    </div>
+
     <div class="kpi-grid">
       <div class="kpi"><p class="label">2i vendors</p><p class="value" id="k-v2">—</p></div>
       <div class="kpi"><p class="label">1i vendors</p><p class="value" id="k-v1">—</p></div>
@@ -130,7 +149,7 @@
 
     <div class="info-row" style="grid-template-columns: repeat(3, 1fr);">
       <div><p class="label">Total slips/mo</p><p class="value" id="m-total">—</p></div>
-      <div><p class="label">Pxx achieved</p><p class="value" id="m-ach">—</p></div>
+      <div><p class="label">Slip coverage</p><p class="value" id="m-ach">—</p></div>
       <div><p class="label">Solver status</p><p class="value" id="m-status">—</p></div>
     </div>
 
@@ -212,16 +231,82 @@ function fmtINR(n) {
 const fmtFull = n => '₹' + Math.round(n).toLocaleString('en-IN');
 
 function updateLabels() {
-  $('r-peak').textContent = val('s-peak').toFixed(1);
+  const v = val('s-peak');
+  $('r-peak').textContent = v <= 1.45 ? 'P50 (typical)' : v <= 1.55 ? 'P75 (stressed)' : 'P90 (planning)';
+  const sk = parseFloat($('s-skew').value);
+  let skLabel;
+  if (sk <= 5) skLabel = '0% (flat)';
+  else if (sk >= 95) skLabel = '100% (historical)';
+  else skLabel = `${sk}% (blended)`;
+  $('r-skew').textContent = skLabel;
   $('r-sl2').textContent = val('s-sl2') + '%';
   $('r-sl1').textContent = val('s-sl1') + '%';
   $('r-elig').textContent = val('s-elig') + '%';
   $('r-tot').textContent = parseInt($('s-tot').value);
 }
-['s-peak','s-sl2','s-sl1','s-elig','s-tot'].forEach(id => {
+['s-peak','s-skew','s-sl2','s-sl1','s-elig','s-tot'].forEach(id => {
   $(id).addEventListener('input', updateLabels);
 });
 updateLabels();
+
+// Load cluster catalog and populate dropdown
+let CLUSTER_CATALOG = {};
+async function loadClusters() {
+  try {
+    const r = await fetch('/clusters');
+    const data = await r.json();
+    const sel = $('s-cluster');
+    sel.innerHTML = '';
+    data.clusters.forEach(c => {
+      CLUSTER_CATALOG[c.name] = c;
+      const opt = document.createElement('option');
+      opt.value = c.name;
+      const noisy = c.is_noisy ? ' ⚠' : '';
+      opt.textContent = `${c.name} (${c.total_12mo} installs)${noisy}`;
+      sel.appendChild(opt);
+    });
+    // Default to Pune if available
+    if (CLUSTER_CATALOG['Pune']) {
+      sel.value = 'Pune';
+    }
+    updateClusterInfo();
+  } catch (e) {
+    console.error('Failed to load clusters:', e);
+  }
+}
+
+function updateClusterInfo() {
+  const name = $('s-cluster').value;
+  const info = CLUSTER_CATALOG[name];
+  if (!info) return;
+  const noisy = info.months_used <= 2 ? ` ⚠ only ${info.months_used} months of data` : '';
+  $('r-cluster-info').textContent = `April: ${info.april_2026 || info.avg_monthly} installs${noisy}`;
+}
+
+function applyClusterDefaults() {
+  const name = $('s-cluster').value;
+  const info = CLUSTER_CATALOG[name];
+  if (!info) return;
+  // Auto-fill slab mix
+  $('a-mix1').value = info.slab_mix[0];
+  $('a-mix2').value = info.slab_mix[1];
+  $('a-mix3').value = info.slab_mix[2];
+  $('a-mix4').value = info.slab_mix[3];
+  // Auto-fill total sites slider with April volume (latest complete month)
+  const volume = info.april_2026 || info.avg_monthly;
+  const slider = $('s-tot');
+  const min = parseInt(slider.min), max = parseInt(slider.max);
+  const v = Math.max(min, Math.min(max, volume));
+  slider.value = v;
+  updateLabels();
+  updateClusterInfo();
+}
+
+document.addEventListener('DOMContentLoaded', loadClusters);
+// Also try immediately in case DOM already loaded
+if (document.readyState !== 'loading') loadClusters();
+
+$('s-cluster').addEventListener('change', applyClusterDefaults);
 
 async function runSolver() {
   const btn = $('solve-btn');
@@ -233,6 +318,8 @@ async function runSolver() {
     total_sites: parseInt($('s-tot').value),
     days: parseInt($('a-days').value),
     peak_ratio: val('s-peak'),
+    skew_pct: parseFloat($('s-skew').value),
+    cluster: $('s-cluster').value,
     elig_pct: val('s-elig') / 100,
     sl2_rate: val('s-sl2') / 100,
     sl1_rate: val('s-sl1') / 100,
@@ -262,6 +349,16 @@ async function runSolver() {
       $('status').className = 'status err';
       $('status').textContent = '❌ ' + data.reason;
       $('report-btn').disabled = true;
+      // Clear stale results from any previous successful run
+      $('k-v2').textContent = '—';
+      $('k-v1').textContent = '—';
+      $('k-pay').textContent = '—';
+      $('k-sav').textContent = '—';
+      $('profit-dist-body').innerHTML = '';
+      $('attempts-body').innerHTML = '';
+      $('demand-chart').innerHTML = '';
+      $('roster').innerHTML = '';
+      $('v-rows').innerHTML = '';
       // If demand stats came along, show them so user sees what was attempted
       if (data.daily) {
         const totalDD = data.pair_count_per_day.reduce((a,b)=>a+b,0);
@@ -269,8 +366,20 @@ async function runSolver() {
         $('m-total').textContent = data.total_slips;
         $('m-ach').textContent = 'N/A';
         $('m-status').textContent = 'INFEASIBLE';
+        let attemptsHtml = '';
+        if (data.all_attempts && data.all_attempts.length) {
+          const rows = data.all_attempts.slice(0, 15).map(a =>
+            `<tr><td>${a.v2}</td><td>${a.v1}</td><td>${a.total}</td><td>${(a.pxx*100).toFixed(0)}%</td><td>${a.status}</td><td>${a.min_profit !== null ? '₹' + Math.round(a.min_profit).toLocaleString('en-IN') : '—'}</td></tr>`
+          ).join('');
+          attemptsHtml = `<div style="margin-top: 12px;"><strong>Attempts tried (${data.all_attempts.length} total, showing first 15):</strong>
+            <table class="data-table" style="font-size: 12px; margin-top: 6px;">
+              <thead><tr><th>2i</th><th>1i</th><th>Total</th><th>Slip cov</th><th>Status</th><th>Min profit</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table></div>`;
+        }
         $('alerts').innerHTML = `<div class="alert danger">${data.reason}</div>
-          <div class="alert warning">Demand at these settings: ${totalDD} DD pairs + ${totalSD} SD sites = ${data.daily.reduce((a,b)=>a+b,0)} total monthly. ${data.total_slips} monthly slips. Try adjusting cost or eligibility.</div>`;
+          <div class="alert warning">Demand at these settings: ${totalDD} DD pairs + ${totalSD} SD sites = ${data.daily.reduce((a,b)=>a+b,0)} total monthly. ${data.total_slips} monthly slips. Try adjusting cost or eligibility.</div>
+          ${attemptsHtml}`;
       }
       return;
     }
@@ -299,7 +408,7 @@ function render(data, elapsed) {
   $('k-sav').textContent = data.savings_pct.toFixed(1) + '%';
 
   $('m-total').textContent = data.total_slips;
-  $('m-ach').innerHTML = `P${Math.round(data.pxx_achieved * 100)}` + (data.pxx_achieved < 0.75 ? ' <small style="color: var(--warning); font-weight: normal;">(degraded from P75)</small>' : '');
+  $('m-ach').innerHTML = `${Math.round(data.pxx_achieved * 100)}%` + (data.pxx_achieved < 0.75 ? ' <small style="color: var(--warning); font-weight: normal;">(degraded from 75%)</small>' : '');
   $('m-status').textContent = data.status;
 
   // Compute and render profit distribution percentiles
@@ -349,8 +458,8 @@ function render(data, elapsed) {
 
   const alerts = [];
   if (data.min_2i < 0 || data.min_1i < 0) alerts.push({lvl:'danger', t:`Some vendors are unprofitable. Min 2i=${fmtINR(data.min_2i)}, min 1i=${fmtINR(data.min_1i)}.`});
-  if (data.pxx_achieved < 0.75) alerts.push({lvl:'warning', t:`Pxx degraded from P75 to P${Math.round(data.pxx_achieved*100)} to keep all vendors profitable.`});
-  if (alerts.length === 0) alerts.push({lvl:'success', t:`Optimal: ${data.total_v} vendors, all profitable, Pxx target hit.`});
+  if (data.pxx_achieved < 0.75) alerts.push({lvl:'warning', t:`Slip coverage degraded from 75% to ${Math.round(data.pxx_achieved*100)}% to keep all vendors profitable.`});
+  if (alerts.length === 0) alerts.push({lvl:'success', t:`Optimal: ${data.total_v} vendors, all profitable, full slip coverage.`});
   $('alerts').innerHTML = alerts.map(a => `<div class="alert ${a.lvl}">${a.t}</div>`).join('');
 
   // ===== Render combinations table (top 10) =====
@@ -517,6 +626,193 @@ async function generateReport() {
   }
 }
 $('report-btn').addEventListener('click', generateReport);
+
+// ============================================================================
+// PAN-INDIA VIEW
+// ============================================================================
+
+const fmtL = n => n >= 10000000
+  ? '₹' + (n/10000000).toFixed(2) + 'Cr'
+  : n >= 100000 ? '₹' + (n/100000).toFixed(2) + 'L'
+  : n >= 1000 ? '₹' + (n/1000).toFixed(1) + 'K'
+  : '₹' + Math.round(n);
+
+async function pollPanIndiaStatus() {
+  try {
+    const r = await fetch('/pan_india');
+    const data = await r.json();
+    const status = $('pan-india-status');
+    if (data.status === 'not_started') {
+      status.textContent = 'Cache: not started';
+    } else if (data.status === 'computing') {
+      status.textContent = `Computing ${data.progress}% — ${data.current_cluster || ''}`;
+      setTimeout(pollPanIndiaStatus, 3000);
+    } else if (data.status === 'ready') {
+      status.textContent = `Cache ready (${data.results.length} clusters)`;
+    } else if (data.status === 'error') {
+      status.textContent = 'Cache: error';
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+pollPanIndiaStatus();
+setInterval(pollPanIndiaStatus, 30000);
+
+async function showPanIndia() {
+  $('pan-india-view').style.display = 'block';
+  $('pan-india-table').innerHTML = '<p style="color: var(--text-faint); font-size: 13px;">Loading...</p>';
+  try {
+    const r = await fetch('/pan_india');
+    const data = await r.json();
+    if (data.status === 'not_started') {
+      $('pan-india-table').innerHTML = '<p style="color: var(--text-faint);">Cache not started. Click "Refresh cache" to build it (takes 5-10 minutes).</p>';
+      return;
+    }
+    if (data.status === 'computing') {
+      $('pan-india-table').innerHTML = `<p style="color: var(--text-faint);">Still computing... ${data.progress}% (currently solving: ${data.current_cluster || ''}). Come back in a minute.</p>`;
+      return;
+    }
+    renderPanIndia(data);
+  } catch (e) {
+    $('pan-india-table').innerHTML = '<p style="color: var(--danger);">Failed to load: ' + e.message + '</p>';
+  }
+}
+
+function renderPanIndia(data) {
+  const t = data.totals;
+  if (t) {
+    // Build breakdown badge: "17 ok, 2 partial, 8 skipped"
+    const breakdown = [];
+    if (t.clusters_ok) breakdown.push(`${t.clusters_ok} ok`);
+    if (t.clusters_partial) breakdown.push(`<span style="color: #b25500;">${t.clusters_partial} partial</span>`);
+    if (t.clusters_infeasible) breakdown.push(`<span style="color: var(--danger);">${t.clusters_infeasible} infeasible</span>`);
+    if (t.clusters_skipped) breakdown.push(`<span style="color: var(--text-faint);">${t.clusters_skipped} skipped</span>`);
+    if (t.clusters_error) breakdown.push(`<span style="color: var(--danger);">${t.clusters_error} errored</span>`);
+    $('pan-india-totals').innerHTML = `
+      <div class="kpi-grid" style="margin-bottom: 8px;">
+        <div class="kpi">
+          <p class="label">Clusters fully solved</p>
+          <p class="value">${t.clusters_ok}<span style="font-size: 14px; color: var(--text-soft); font-weight: 400;"> / ${t.clusters_total}</span></p>
+        </div>
+        <div class="kpi">
+          <p class="label">Total vendors</p>
+          <p class="value">${t.total_vendors}</p>
+        </div>
+        <div class="kpi">
+          <p class="label">Modelled payout</p>
+          <p class="value">${fmtL(t.total_payout)}</p>
+        </div>
+        <div class="kpi success">
+          <p class="label">SSE savings (ok only)</p>
+          <p class="value">${t.total_savings_pct}%</p>
+        </div>
+      </div>
+      <div style="font-size: 11px; color: var(--text-faint); margin-bottom: 4px;">
+        Status: ${breakdown.join(' · ')}${t.clusters_partial ? ` (₹${(t.total_unprofitable_amount/1000).toFixed(1)}K vendor losses excluded from headline)` : ''}
+      </div>
+      <div style="font-size: 11px; color: var(--text-faint);">
+        Baseline ${fmtL(t.total_baseline)} → Modelled ${fmtL(t.total_payout)} = ${fmtL(t.total_savings_rs)} savings.
+        Settings: April 2026 volume, P75 demand, cluster-specific skew (60-80%), 2i slip 10% / 1i slip 20%, default slab rates.
+      </div>
+    `;
+  }
+  // Sort: solved clusters first by savings desc, then partial, then skipped, then errors
+  const statusOrder = { 'ok': 0, 'partial': 1, 'infeasible': 2, 'skipped_low_volume': 3, 'error': 4 };
+  const sorted = [...data.results].sort((a, b) => {
+    const orderA = statusOrder[a.status] ?? 99;
+    const orderB = statusOrder[b.status] ?? 99;
+    if (orderA !== orderB) return orderA - orderB;
+    return (b.savings_pct || 0) - (a.savings_pct || 0);
+  });
+  let html = '<table style="width:100%; border-collapse: collapse; font-size: 13px;"><thead><tr style="background: #f5f5f7; text-align: left; border-bottom: 2px solid var(--border);"><th style="padding: 10px 8px; font-weight: 600;">Cluster</th><th style="padding: 10px 8px; font-weight: 600;">April vol</th><th style="padding: 10px 8px; font-weight: 600;">Vendors (2i+1i)</th><th style="padding: 10px 8px; font-weight: 600; text-align: right;">SSE savings</th><th style="padding: 10px 8px; font-weight: 600;">Status</th><th style="padding: 10px 8px;"></th></tr></thead><tbody>';
+  sorted.forEach((r, idx) => {
+    const noisy = r.is_noisy ? ' <span style="color: #d97706;" title="Only ' + r.months_used + ' months of data">⚠</span>' : '';
+    let badge = '';
+    if (r.status === 'ok') badge = `<span style="color: var(--success); font-size: 11px;">✓ OK</span>`;
+    else if (r.status === 'partial') badge = `<span style="color: #b25500; font-size: 11px;" title="${r.unprofitable_count} vendor(s) lose Rs ${r.unprofitable_amount}">⚠ Partial (vendor loss)</span>`;
+    else if (r.status === 'skipped_low_volume') badge = `<span style="color: var(--text-faint); font-size: 11px;">skipped (low vol)</span>`;
+    else if (r.status === 'infeasible') badge = `<span style="color: var(--danger); font-size: 11px;">infeasible</span>`;
+    else badge = `<span style="color: var(--danger); font-size: 11px;">error</span>`;
+    // Color-code savings: >25% green, 15-25% normal, <15% orange
+    // For 'partial' status, gray it out (not a real savings)
+    let savingsHtml = '—';
+    if (r.status === 'ok') {
+      let savingsColor = 'inherit';
+      let savingsBg = 'transparent';
+      if (r.savings_pct >= 25) { savingsColor = '#187a3b'; savingsBg = '#e8f5ec'; }
+      else if (r.savings_pct < 15) { savingsColor = '#b25500'; savingsBg = '#fff4e6'; }
+      savingsHtml = `<span style="color: ${savingsColor}; background: ${savingsBg}; padding: 3px 8px; border-radius: 4px; font-weight: 600;">${r.savings_pct}%</span>`;
+    } else if (r.status === 'partial') {
+      savingsHtml = `<span style="color: var(--text-faint); text-decoration: line-through;">${r.savings_pct}%</span>`;
+    }
+    const vendors = (r.status === 'ok' || r.status === 'partial') ? `<span style="font-variant-numeric: tabular-nums;">${r.v2} + ${r.v1} = <strong>${r.total_v}</strong></span>` : '—';
+    const arrow = (r.status === 'ok' || r.status === 'partial') ? `<button class="exp-btn" data-idx="${idx}" style="background: white; border: 1px solid var(--border); padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: 11px;">Details ▼</button>` : '';
+    const rowBg = r.status === 'partial' ? 'background: #fff9f0;' : '';
+    html += `<tr style="border-bottom: 1px solid var(--border); ${rowBg}"><td style="padding: 10px 8px; font-weight: 500;">${r.cluster}${noisy}</td><td style="padding: 10px 8px; font-variant-numeric: tabular-nums;">${r.volume}</td><td style="padding: 10px 8px;">${vendors}</td><td style="padding: 10px 8px; text-align: right;">${savingsHtml}</td><td style="padding: 10px 8px;">${badge}</td><td style="padding: 10px 8px; text-align: right;">${arrow}</td></tr>`;
+    if (r.status === 'ok' || r.status === 'partial') {
+      html += `<tr id="detail-${idx}" style="display: none; background: #fafbff;"><td colspan="6" style="padding: 16px;">${renderClusterDetail(r)}</td></tr>`;
+    }
+  });
+  html += '</tbody></table>';
+  $('pan-india-table').innerHTML = html;
+  // Wire up expand buttons
+  document.querySelectorAll('.exp-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const idx = btn.getAttribute('data-idx');
+      const row = $(`detail-${idx}`);
+      if (row.style.display === 'none') {
+        row.style.display = '';
+        btn.textContent = 'Hide ▲';
+      } else {
+        row.style.display = 'none';
+        btn.textContent = 'Details ▼';
+      }
+    });
+  });
+}
+
+function renderClusterDetail(r) {
+  const profitTable = (d, label, count, avg) => `
+    <div style="flex: 1; min-width: 240px;">
+      <div style="font-size: 12px; font-weight: 600; margin-bottom: 6px; color: var(--text-soft);">${label} <span style="color: var(--text-faint); font-weight: 400;">(${count} vendors)</span></div>
+      <table style="width: 100%; border-collapse: collapse; font-size: 12px; background: white; border: 1px solid var(--border); border-radius: 4px; overflow: hidden;">
+        <tbody>
+          <tr style="border-bottom: 1px solid var(--border);"><td style="padding: 6px 10px; color: var(--text-soft);">P0 (min)</td><td style="padding: 6px 10px; text-align: right; font-variant-numeric: tabular-nums;">${fmtL(d.P0)}</td></tr>
+          <tr style="border-bottom: 1px solid var(--border);"><td style="padding: 6px 10px; color: var(--text-soft);">P25</td><td style="padding: 6px 10px; text-align: right; font-variant-numeric: tabular-nums;">${fmtL(d.P25)}</td></tr>
+          <tr style="border-bottom: 1px solid var(--border); background: #f8fafc;"><td style="padding: 6px 10px; color: var(--text-soft); font-weight: 600;">P50 (median)</td><td style="padding: 6px 10px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600;">${fmtL(d.P50)}</td></tr>
+          <tr style="border-bottom: 1px solid var(--border);"><td style="padding: 6px 10px; color: var(--text-soft);">P75</td><td style="padding: 6px 10px; text-align: right; font-variant-numeric: tabular-nums;">${fmtL(d.P75)}</td></tr>
+          <tr style="border-bottom: 1px solid var(--border);"><td style="padding: 6px 10px; color: var(--text-soft);">P90</td><td style="padding: 6px 10px; text-align: right; font-variant-numeric: tabular-nums;">${fmtL(d.P90)}</td></tr>
+          <tr style="border-bottom: 1px solid var(--border);"><td style="padding: 6px 10px; color: var(--text-soft);">P100 (max)</td><td style="padding: 6px 10px; text-align: right; font-variant-numeric: tabular-nums;">${fmtL(d.P100)}</td></tr>
+          <tr style="background: var(--success-soft);"><td style="padding: 6px 10px; color: var(--success); font-weight: 600;">Average</td><td style="padding: 6px 10px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; color: var(--success);">${fmtL(avg)}</td></tr>
+        </tbody>
+      </table>
+    </div>
+  `;
+  const mix = r.slab_mix.map((p, i) => `S${i+1}: ${p}%`).join(' · ');
+  return `
+    <div style="display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start;">
+      ${r.v2 > 0 ? profitTable(r.dist_2i, '2-Install', r.v2, r.avg_2i) : ''}
+      ${r.v1 > 0 ? profitTable(r.dist_1i, '1-Install', r.v1, r.avg_1i) : ''}
+    </div>
+    <div style="margin-top: 12px; padding: 8px 12px; background: white; border: 1px solid var(--border); border-radius: 4px; font-size: 11px; color: var(--text-soft); display: flex; flex-wrap: wrap; gap: 16px;">
+      <span><strong>Payout:</strong> ${fmtL(r.total_payout)}</span>
+      <span><strong>Baseline:</strong> ${fmtL(r.baseline_cost)}</span>
+      <span><strong>Savings:</strong> <span style="color: var(--success); font-weight: 600;">${fmtL(r.savings_rs)}</span></span>
+      <span><strong>Skew:</strong> ${r.skew}%</span>
+      <span><strong>Slab mix:</strong> ${mix}</span>
+    </div>
+  `;
+}
+
+$('pan-india-btn').addEventListener('click', showPanIndia);
+$('pan-india-close').addEventListener('click', () => $('pan-india-view').style.display = 'none');
+$('pan-india-refresh').addEventListener('click', async () => {
+  if (!confirm('This will recompute all 27 clusters and take 5-10 minutes. Proceed?')) return;
+  await fetch('/pan_india/refresh', { method: 'POST' });
+  $('pan-india-table').innerHTML = '<p style="color: var(--text-faint);">Refresh started in background. Reopen this view in a few minutes.</p>';
+  pollPanIndiaStatus();
+});
 </script>
 </body>
 </html>
