@@ -1994,11 +1994,16 @@ PAN_INDIA_CACHE = {
 }
 
 # Default inputs for pan-India runs (cluster-independent)
+# Guardrails per AOP framing:
+#   - Daily demand confidence: P75 (no cluster runs below P50)
+#   - Peak shaving: max 30% across all clusters (pan_india_skew = 70 = 30% shaving)
+#   - Slip rates: 2i = 10%, 1i = 20% (conservative for AOP commitments)
+#   - Per-cluster slab mix and baseline auto-loaded from clusters.py
 PAN_INDIA_DEFAULTS = {
     'days': 30,
     'peak_ratio': 1.5,           # P75 (between 1.45 and 1.55)
-    'sl2_rate': 0.10,             # 2i slip rate (upper bound of 5-10%)
-    'sl1_rate': 0.20,             # 1i slip rate (upper bound of 10-30%)
+    'sl2_rate': 0.10,             # 2i slip rate
+    'sl1_rate': 0.20,             # 1i slip rate
     'elig_pct': 0.50,             # 2i eligibility
     'target_pxx': 0.75,
     'slab_rates': [8000, 8500, 10000, 15000],
