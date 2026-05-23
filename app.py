@@ -172,16 +172,20 @@ def end_skewed_demand(total, days, peak_ratio, skew_pct=100, cluster='Pune'):
 
     # Pick percentile level based on peak_ratio slider value (1.0–6.0)
     # The slider value directly indicates which stop: 1=P0, 2=P25, 3=P50, 4=P75, 5=P90, 6=P100
-    # Backward compat: 1.3-1.45 still maps to P50, 1.45-1.55 to P75, >=1.55 to P90
-    if peak_ratio < 1.0:
+    # Map peak_ratio (from slider 0-5 * 0.15 + 1.0) to percentile label
+    # Slider 0 → 1.00 → P0
+    # Slider 1 → 1.15 → P25
+    # Slider 2 → 1.30 → P50
+    # Slider 3 → 1.45 → P75
+    # Slider 4 → 1.60 → P90
+    # Slider 5 → 1.75 → P100
+    if peak_ratio <= 1.05:
         pct_label = 'P0'
-    elif peak_ratio <= 1.05:
-        pct_label = 'P0'
-    elif peak_ratio <= 1.30:
+    elif peak_ratio <= 1.20:
         pct_label = 'P25'
-    elif peak_ratio <= 1.45:
+    elif peak_ratio <= 1.35:
         pct_label = 'P50'
-    elif peak_ratio <= 1.55:
+    elif peak_ratio <= 1.50:
         pct_label = 'P75'
     elif peak_ratio <= 1.65:
         pct_label = 'P90'
@@ -610,7 +614,7 @@ def optimize_slabs_cpsat(activity, v2, days, dd_pairs_per_day, sd_slabs_per_day,
 
 def find_optimal_fast(daily, dd_pairs_per_day, sd_slabs_per_day, pair_count, sd_count,
                       peak_day, sl2, sl1, target_pxx, slab_rates_2i, slab_rates_1i, dd_discount,
-                      cost_2i, cost_1i, time_limit_sec, max_working_days):
+                      cost_2i, cost_1i, time_limit_sec, max_working_days, deep_mode=False):
     days = len(daily)
     # lb_v2: max of consecutive DD pairs (no consec constraint) and peak DD
     lb_v2 = max((pair_count[d] + pair_count[d + 1] for d in range(days - 1)), default=0)
@@ -637,20 +641,18 @@ def find_optimal_fast(daily, dd_pairs_per_day, sd_slabs_per_day, pair_count, sd_
         if p < target_pxx and p not in pxx_levels:
             pxx_levels.append(p)
 
-    # Iteration-based caps (replaces wall-clock for cross-machine determinism):
-    # - SOFT_CAP = 50: after 50 iterations, stop IF we have a profitable solution
-    # - HARD_CAP = 100: stop unconditionally after 100 iterations
-    # Each iteration is one (v2, v1, pxx) attempt. Determinism: same params → same iteration count → same result.
-    SOFT_ITER_CAP = 50
-    HARD_ITER_CAP = 100
-    print(f'[solver] Iteration caps: soft={SOFT_ITER_CAP} (return first profitable), hard={HARD_ITER_CAP}')
-
-    # Per-call CP-SAT time budget. Tuned for 1-2 minute total runtime:
-    # - 1s per Phase A iteration × up to 100 iterations ≈ 100s
-    # - Plus ~30 Phase B at 2s ≈ 60s (only profitable iterations)
-    # - Plus 15s polish at end
-    # Total typical: 1-2 min depending on how many iterations are profitable.
-    per_call_time = 1
+    # Iteration-based caps. Deep mode (pan-India precompute) uses 5x larger caps
+    # because it runs in the background and can afford to search exhaustively.
+    if deep_mode:
+        SOFT_ITER_CAP = 250
+        HARD_ITER_CAP = 500
+        per_call_time = 5  # 5s per Phase A iteration instead of 1s
+        print(f'[solver] DEEP MODE: caps soft={SOFT_ITER_CAP}, hard={HARD_ITER_CAP}, per-call={per_call_time}s')
+    else:
+        SOFT_ITER_CAP = 50
+        HARD_ITER_CAP = 100
+        per_call_time = 1
+        print(f'[solver] Iteration caps: soft={SOFT_ITER_CAP} (return first profitable), hard={HARD_ITER_CAP}')
 
     # Track best partial solution in case no fully-profitable exists
     best_partial = None
@@ -789,11 +791,9 @@ def find_optimal_fast(daily, dd_pairs_per_day, sd_slabs_per_day, pair_count, sd_
 
                 # Phase B: if Phase A is profitable, run quick CP-SAT slab optimization
                 if all_prof:
-                    # Phase B per candidate is QUICK — just enough to differentiate candidates.
-                    # The winning candidate gets a full polish at the end.
-                    # Fixed 2s budget per Phase B for determinism + 1-2 min total cap.
-                    phase_b_time = 2
-                    print(f'[solver]   Phase A profitable. Running quick Phase B ({phase_b_time}s)...')
+                    # Phase B per candidate. Deep mode searches longer.
+                    phase_b_time = 8 if deep_mode else 2
+                    print(f'[solver]   Phase A profitable. Running Phase B ({phase_b_time}s)...')
                     optimized, opt_status = optimize_slabs_cpsat(
                         activity, v2, days, dd_pairs_per_day, sd_slabs_per_day,
                         slab_rates_2i, slab_rates_1i, dd_discount, cost_2i, cost_1i, phase_b_time
@@ -819,12 +819,33 @@ def find_optimal_fast(daily, dd_pairs_per_day, sd_slabs_per_day, pair_count, sd_
                 total_fixed_cand = v2 * cost_2i + v1 * cost_1i
                 total_profit_cand = total_payout_cand - total_fixed_cand
 
+                # Per-vendor profits (for scoring stats)
+                vendor_profits = []
+                for vi in range(v2):
+                    vendor_profits.append(payouts[vi] - cost_2i)
+                for vi in range(v2, v2 + v1):
+                    vendor_profits.append(payouts[vi] - cost_1i)
+                # P75 of vendor profits (ascending sort, 75th-percentile vendor)
+                vps_sorted = sorted(vendor_profits)
+                p75_idx = int(0.75 * (len(vps_sorted) - 1))
+                p75_profit = vps_sorted[p75_idx] if vps_sorted else 0
+                # 2i vs 1i averages
+                profits_2i_list = vendor_profits[:v2]
+                profits_1i_list = vendor_profits[v2:]
+                avg_2i_profit = sum(profits_2i_list) / len(profits_2i_list) if profits_2i_list else 0
+                avg_1i_profit = sum(profits_1i_list) / len(profits_1i_list) if profits_1i_list else 0
+                v2_premium_ok = (v2 == 0 or v1 == 0 or avg_2i_profit > avg_1i_profit)
+
                 candidate = {
                     'v2': v2, 'v1': v1, 'roster': roster, 'status': status,
                     'pxx_achieved': pxx, 'sl_needed': sl_needed, 'mc': mc, 'payouts': payouts,
                     'all_profitable': all_prof, 'unprofitable_amount': unprof_sum,
                     'activity': activity,  # for polish phase
                     'total_profit': total_profit_cand,
+                    'p75_profit': p75_profit,
+                    'avg_2i_profit': avg_2i_profit,
+                    'avg_1i_profit': avg_1i_profit,
+                    'v2_premium_ok': v2_premium_ok,
                 }
 
                 # Compute min for tracking
@@ -862,18 +883,31 @@ def find_optimal_fast(daily, dd_pairs_per_day, sd_slabs_per_day, pair_count, sd_
 
     # Done iterating. Pick best candidate.
     if profitable_candidates:
-        # Sort by: (1) highest total profit, (2) fewest vendors, (3) highest min profit
-        # Total profit is the primary business outcome. Vendor count is a tiebreaker
-        # (fewer vendors = simpler ops, less reliance risk). Min profit ensures fairness.
-        def candidate_score(c):
-            return (-c['total_profit'], c['v2'] + c['v1'], -c['min_profit'])
+        # Cluster-level scoring (always): (1) highest total profit, (2) fewest vendors, (3) highest min profit
+        # Deep mode (pan-India) adds ONE soft tiebreaker: prefer candidates where 2i avg > 1i avg.
+        # This sits AFTER total profit and vendor count — it only breaks ties, never overrides.
+        if deep_mode:
+            def candidate_score(c):
+                return (
+                    -c['total_profit'],
+                    c['v2'] + c['v1'],
+                    0 if c.get('v2_premium_ok', True) else 1,  # soft: 2i should earn > 1i
+                    -c['min_profit'],
+                )
+        else:
+            def candidate_score(c):
+                return (-c['total_profit'], c['v2'] + c['v1'], -c['min_profit'])
         profitable_candidates.sort(key=candidate_score)
         best = profitable_candidates[0]
         print(f'[solver] Searched {iter_count} iterations. Found {len(profitable_candidates)} profitable candidates.')
-        print(f'[solver] Initial pick: v2={best["v2"]}, v1={best["v1"]}, total_profit=₹{best["total_profit"]:.0f}, min_profit=₹{best["min_profit"]:.0f}')
+        if deep_mode:
+            premium = "✓ 2i premium" if best.get('v2_premium_ok') else "⚠ no 2i premium"
+            print(f'[solver] Initial pick (deep mode): v2={best["v2"]}, v1={best["v1"]}, total_profit=₹{best["total_profit"]:.0f}, 2i avg=₹{best.get("avg_2i_profit", 0):.0f}, 1i avg=₹{best.get("avg_1i_profit", 0):.0f} {premium}')
+        else:
+            print(f'[solver] Initial pick: v2={best["v2"]}, v1={best["v1"]}, total_profit=₹{best["total_profit"]:.0f}, min_profit=₹{best["min_profit"]:.0f}')
 
-        # POLISH PHASE: fixed 10s budget for determinism + 1-2 min total cap.
-        polish_time = 10
+        # POLISH PHASE: deep mode runs polish longer for best refinement.
+        polish_time = 60 if deep_mode else 10
         if 'activity' in best:
             print(f'[solver] Polish phase: {polish_time}s with heavy spread weight (=10)')
             polished_result, polished_status = optimize_slabs_cpsat(
@@ -948,9 +982,12 @@ def run_solver(params):
     print(f'[solver] 2i rates: {slab_rates_2i}')
     print(f'[solver] 1i rates: {slab_rates_1i}')
 
+    # Deep mode: triggered by pan-India precompute, allows longer search per cluster
+    deep_mode = bool(params.get('_deep_mode', False))
+
     result = find_optimal_fast(daily, dd_pairs, sd_slabs, pair_count, sd_count,
                                peak_day, sl2_rate, sl1_rate, target_pxx, slab_rates_2i, slab_rates_1i,
-                               dd_discount, cost_2i, cost_1i, time_limit, max_working_days)
+                               dd_discount, cost_2i, cost_1i, time_limit, max_working_days, deep_mode=deep_mode)
 
     if result is None or result.get('_diagnostic_only'):
         diag_attempts = result.get('all_attempts', []) if result else []
@@ -1998,6 +2035,9 @@ def compute_pan_india_for_cluster(cluster_name):
     # Use cluster's actual baseline Rs/site (P50 of Jan-Mar 2026 actuals)
     cluster_baseline = info.get('baseline_per_site', PAN_INDIA_DEFAULTS['baseline_per_site'])
     params['baseline_per_site'] = cluster_baseline
+    # DEEP MODE: pan-India runs in background and can afford to search much harder
+    # for the truly optimal solution per cluster. Override iteration/time caps.
+    params['_deep_mode'] = True
 
     # Detailed pre-solve log so you can verify inputs
     print(f'\n[pan-india/{cluster_name}] ============================================')
