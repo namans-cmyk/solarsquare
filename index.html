@@ -76,7 +76,7 @@
     <div class="panel">
       <h3>Sliders</h3>
       <label class="field"><div class="row"><span>Cluster</span><span id="r-cluster-info" style="font-size: 10px; color: var(--text-faint);"></span></div><select id="s-cluster" style="width: 100%; padding: 6px; font-size: 13px; border: 1px solid var(--border); border-radius: 4px; background: white;"></select></label>
-      <label class="field"><div class="row"><span>Daily demand confidence</span><span id="r-peak">P75</span></div><input type="range" id="s-peak" min="1.0" max="1.8" step="0.15" value="1.5"></label>
+      <label class="field"><div class="row"><span>Daily demand confidence</span><span id="r-peak">P75</span></div><input type="range" id="s-peak" min="0" max="5" step="1" value="3"></label>
       <label class="field"><div class="row"><span>Peak shaving</span><span id="r-skew">0%</span></div><input type="range" id="s-skew" min="0" max="100" step="5" value="0"></label>
       <label class="field"><div class="row"><span>Slip % on 2-install sites</span><span id="r-sl2">10%</span></div><input type="range" id="s-sl2" min="0" max="100" step="1" value="10"></label>
       <label class="field"><div class="row"><span>Slip % on 1-install sites</span><span id="r-sl1">20%</span></div><input type="range" id="s-sl1" min="0" max="100" step="1" value="20"></label>
@@ -132,12 +132,15 @@
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
         <h3 style="margin: 0; font-size: 18px;">Pan-India view</h3>
         <div>
-          <button id="pan-india-refresh" style="background: #f5f5f7; border: 1px solid var(--border); padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer;">Refresh cache</button>
-          <button id="pan-india-close" style="background: #f5f5f7; border: 1px solid var(--border); padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; margin-left: 4px;">Close</button>
+          <button id="pan-india-refresh" style="background: #f5f5f7; border: 1px solid var(--border); padding: 6px 12px; border-radius: 4px; font-size: 12px; cursor: pointer;">Refresh cache</button>
+          <button id="pan-india-close" style="background: #dc2626; color: white; border: 1px solid #b91c1c; padding: 6px 14px; border-radius: 4px; font-size: 12px; cursor: pointer; margin-left: 6px; font-weight: 600;">✕ Close</button>
         </div>
       </div>
       <div id="pan-india-totals" style="margin-bottom: 16px;"></div>
       <div id="pan-india-table"></div>
+      <div style="margin-top: 16px; padding: 10px 12px; background: #fef3c7; border-left: 3px solid #d97706; border-radius: 4px; font-size: 12px; color: #78350f;">
+        <strong>Note:</strong> Charts, calendar, and KPIs shown BELOW this panel are for the <strong id="pan-india-below-cluster">currently loaded cluster</strong> from the regular solver. They are NOT pan-India numbers. Close this panel to return focus to the per-cluster view.
+      </div>
     </div>
 
     <div class="kpi-grid">
@@ -231,17 +234,10 @@ function fmtINR(n) {
 const fmtFull = n => '₹' + Math.round(n).toLocaleString('en-IN');
 
 function updateLabels() {
-  const v = val('s-peak');
-  // Map slider value to percentile label
-  // 1.0=P0, 1.15=P25, 1.30=P50, 1.45=P75, 1.60=P90, 1.75=P100
-  let pctLabel;
-  if (v <= 1.05) pctLabel = 'P0';
-  else if (v <= 1.20) pctLabel = 'P25';
-  else if (v <= 1.35) pctLabel = 'P50';
-  else if (v <= 1.50) pctLabel = 'P75';
-  else if (v <= 1.65) pctLabel = 'P90';
-  else pctLabel = 'P100';
-  $('r-peak').textContent = pctLabel;
+  // Slider value 0-5 maps directly to P0/P25/P50/P75/P90/P100
+  const stops = ['P0', 'P25', 'P50', 'P75', 'P90', 'P100'];
+  const idx = parseInt($('s-peak').value);
+  $('r-peak').textContent = stops[idx];
   // Peak shaving: 0 = no shaving (full historical lumpiness), 100 = full flattening
   const sk = parseFloat($('s-skew').value);
   $('r-skew').textContent = `${sk}%`;
@@ -276,6 +272,7 @@ async function loadClusters() {
       sel.value = 'Pune';
     }
     updateClusterInfo();
+    applyClusterDefaults();  // Auto-fill baseline + slab mix + volume on initial load
   } catch (e) {
     console.error('Failed to load clusters:', e);
   }
@@ -327,7 +324,8 @@ async function runSolver() {
   const params = {
     total_sites: parseInt($('s-tot').value),
     days: parseInt($('a-days').value),
-    peak_ratio: val('s-peak'),
+    // Slider 0-5 maps to P0-P100. Backend expects peak_ratio (1.0-1.80) for legacy reasons.
+    peak_ratio: 1.0 + parseInt($('s-peak').value) * 0.15,
     skew_pct: 100 - parseFloat($('s-skew').value),  // UI = peak shaving %, backend = % of historical shape (inverted)
     cluster: $('s-cluster').value,
     elig_pct: val('s-elig') / 100,
@@ -671,6 +669,10 @@ setInterval(pollPanIndiaStatus, 30000);
 
 async function showPanIndia() {
   $('pan-india-view').style.display = 'block';
+  // Update the "below cluster" notice with the current cluster
+  const currentCluster = $('s-cluster').value || 'no cluster';
+  const belowEl = $('pan-india-below-cluster');
+  if (belowEl) belowEl.textContent = currentCluster;
   $('pan-india-table').innerHTML = '<p style="color: var(--text-faint); font-size: 13px;">Loading...</p>';
   try {
     const r = await fetch('/pan_india');
@@ -809,7 +811,7 @@ function renderClusterDetail(r) {
       <span><strong>Payout:</strong> ${fmtL(r.total_payout)}</span>
       <span><strong>Baseline:</strong> ${fmtL(r.baseline_cost)}</span>
       <span><strong>Savings:</strong> <span style="color: var(--success); font-weight: 600;">${fmtL(r.savings_rs)}</span></span>
-      <span><strong>Skew:</strong> ${r.skew}%</span>
+      <span><strong>Peak shaving:</strong> ${100 - r.skew}%</span>
       <span><strong>Slab mix:</strong> ${mix}</span>
     </div>
   `;
