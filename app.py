@@ -102,7 +102,13 @@ except Exception as e:
 # Indices 0-29 represent days 1-30. Use linear interpolation between percentiles.
 PUNE_DAY_DISTRIBUTION = {
     # Each value is "% of monthly total installs on this day-of-month, at percentile X"
-    # Range across 11 months: [P50, P75, P90]
+    # Range across 11 months: P0, P25, P50, P75, P90, P100
+    'P0':  [0.00, 1.02, 0.32, 0.00, 0.72, 2.08, 1.30, 0.88, 1.02, 0.72,
+            2.25, 1.45, 2.59, 2.71, 2.10, 1.45, 2.54, 0.74, 0.98, 1.33,
+            0.00, 0.95, 2.14, 1.24, 1.73, 2.28, 2.03, 2.59, 2.77, 3.55],
+    'P25': [1.31, 1.46, 1.55, 1.38, 1.96, 2.47, 2.38, 2.42, 1.76, 2.29,
+            3.00, 2.91, 2.93, 3.11, 3.16, 2.51, 2.92, 2.77, 2.05, 2.40,
+            3.05, 2.76, 3.25, 2.62, 2.63, 2.87, 3.01, 3.86, 3.62, 4.10],
     'P50': [1.49, 2.07, 1.97, 1.88, 2.77, 3.12, 2.64, 3.21, 3.02, 2.87,
             3.65, 3.35, 3.24, 3.81, 3.70, 3.51, 3.39, 3.36, 3.32, 3.55,
             3.47, 3.11, 3.53, 3.05, 4.32, 3.49, 3.48, 4.36, 4.84, 5.65],
@@ -112,6 +118,9 @@ PUNE_DAY_DISTRIBUTION = {
     'P90': [3.40, 2.53, 2.90, 4.41, 3.55, 4.35, 4.25, 4.12, 3.93, 4.34,
             4.55, 4.06, 4.25, 6.52, 4.24, 4.50, 4.53, 4.35, 3.82, 4.85,
             4.58, 4.35, 4.81, 4.97, 5.07, 4.59, 4.46, 5.58, 5.66, 6.63],
+    'P100': [4.15, 4.50, 3.33, 5.08, 4.44, 4.61, 5.07, 5.47, 5.07, 4.55,
+             5.08, 4.14, 4.57, 6.60, 4.71, 5.30, 5.48, 4.88, 5.19, 5.12,
+             5.80, 4.71, 5.58, 5.08, 5.41, 5.07, 4.68, 6.52, 6.52, 7.27],
 }
 
 
@@ -161,13 +170,23 @@ def end_skewed_demand(total, days, peak_ratio, skew_pct=100, cluster='Pune'):
             arr[i % days] += 1
         return arr
 
-    # Pick percentile level based on peak_ratio slider
-    if peak_ratio <= 1.45:
+    # Pick percentile level based on peak_ratio slider value (1.0–6.0)
+    # The slider value directly indicates which stop: 1=P0, 2=P25, 3=P50, 4=P75, 5=P90, 6=P100
+    # Backward compat: 1.3-1.45 still maps to P50, 1.45-1.55 to P75, >=1.55 to P90
+    if peak_ratio < 1.0:
+        pct_label = 'P0'
+    elif peak_ratio <= 1.05:
+        pct_label = 'P0'
+    elif peak_ratio <= 1.30:
+        pct_label = 'P25'
+    elif peak_ratio <= 1.45:
         pct_label = 'P50'
     elif peak_ratio <= 1.55:
         pct_label = 'P75'
-    else:
+    elif peak_ratio <= 1.65:
         pct_label = 'P90'
+    else:
+        pct_label = 'P100'
 
     # Get distribution for the selected cluster, falling back to Pune
     cluster_info = CLUSTER_DATA.get(cluster) or CLUSTER_DATA.get('Pune')
@@ -1912,6 +1931,7 @@ def clusters_route():
             'avg_monthly': info['avg_monthly'],
             'april_2026': info.get('april_2026', info['avg_monthly']),
             'pan_india_skew': info.get('pan_india_skew', 70),
+            'baseline_per_site': info.get('baseline_per_site', 10572),
             'total_12mo': info['total_12mo'],
             'months_used': info['months_used'],
             'slab_mix': info['slab_mix'],
@@ -1975,6 +1995,9 @@ def compute_pan_india_for_cluster(cluster_name):
     params['skew_pct'] = info.get('pan_india_skew', 70)
     # Use cluster's actual slab mix
     params['slab_mix'] = info['slab_mix']
+    # Use cluster's actual baseline Rs/site (P50 of Jan-Mar 2026 actuals)
+    cluster_baseline = info.get('baseline_per_site', PAN_INDIA_DEFAULTS['baseline_per_site'])
+    params['baseline_per_site'] = cluster_baseline
 
     # Detailed pre-solve log so you can verify inputs
     print(f'\n[pan-india/{cluster_name}] ============================================')
@@ -1993,7 +2016,7 @@ def compute_pan_india_for_cluster(cluster_name):
     print(f'[pan-india/{cluster_name}]   cost_2i:        Rs {params["cost_2i"]:,.0f}')
     print(f'[pan-india/{cluster_name}]   cost_1i:        Rs {params["cost_1i"]:,.0f}')
     print(f'[pan-india/{cluster_name}]   dd_discount:    {params["dd_discount"]}')
-    print(f'[pan-india/{cluster_name}]   baseline/site:  Rs {params["baseline_per_site"]:,.0f}')
+    print(f'[pan-india/{cluster_name}]   baseline/site:  Rs {cluster_baseline:,.0f}  (P50 of Jan-Mar 2026 actuals)')
     print(f'[pan-india/{cluster_name}]   max_work_days:  {params["max_working_days"]}')
 
     import time as _time
@@ -2027,9 +2050,9 @@ def compute_pan_india_for_cluster(cluster_name):
         dist_1i = {f'P{p}': round(pxx(profits_1i, p)) for p in [0, 25, 50, 75, 90, 100]}
         avg_2i = round(sum(profits_2i) / len(profits_2i)) if profits_2i else 0
         avg_1i = round(sum(profits_1i) / len(profits_1i)) if profits_1i else 0
-        # Compute SSE savings
+        # Compute SSE savings using THIS CLUSTER's baseline (not the global default)
         total_payout = result.get('total_payout', 0)
-        baseline_total = volume * PAN_INDIA_DEFAULTS['baseline_per_site']
+        baseline_total = volume * cluster_baseline
         savings = baseline_total - total_payout
         savings_pct = (savings / baseline_total * 100) if baseline_total > 0 else 0
 
