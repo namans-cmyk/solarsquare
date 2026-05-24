@@ -81,7 +81,7 @@
       <label class="field"><div class="row"><span>Slip % on 2-install sites</span><span id="r-sl2">10%</span></div><input type="range" id="s-sl2" min="0" max="100" step="1" value="10"></label>
       <label class="field"><div class="row"><span>Slip % on 1-install sites</span><span id="r-sl1">20%</span></div><input type="range" id="s-sl1" min="0" max="100" step="1" value="20"></label>
       <label class="field"><div class="row"><span>2i eligibility % (daily)</span><span id="r-elig">40%</span></div><input type="range" id="s-elig" min="20" max="100" step="1" value="40"></label>
-      <label class="field"><div class="row"><span>Total sites in month</span><span id="r-tot">530</span></div><input type="range" id="s-tot" min="200" max="2000" step="10" value="530"></label>
+      <label class="field"><div class="row"><span>Total sites in month</span><span id="r-tot">530</span></div><input type="range" id="s-tot" min="30" max="2000" step="10" value="530"></label>
     </div>
 
     <div class="panel">
@@ -647,11 +647,14 @@ const fmtL = n => n >= 10000000
 
 async function pollPanIndiaStatus() {
   try {
-    const r = await fetch('/pan_india');
+    // Cache-bust with timestamp to avoid browser caching the response
+    const r = await fetch('/pan_india?_t=' + Date.now(), {cache: 'no-store'});
     const data = await r.json();
     const status = $('pan-india-status');
     if (data.status === 'not_started') {
       status.textContent = 'Cache: not started';
+      // Even if not_started, keep checking in case backend just launched
+      setTimeout(pollPanIndiaStatus, 5000);
     } else if (data.status === 'computing') {
       status.textContent = `Computing ${data.progress}% — ${data.current_cluster || ''}`;
       setTimeout(pollPanIndiaStatus, 3000);
@@ -659,13 +662,18 @@ async function pollPanIndiaStatus() {
       status.textContent = `Cache ready (${data.results.length} clusters)`;
     } else if (data.status === 'error') {
       status.textContent = 'Cache: error';
+      setTimeout(pollPanIndiaStatus, 10000);
+    } else {
+      // Unknown state, retry
+      setTimeout(pollPanIndiaStatus, 5000);
     }
   } catch (e) {
-    // ignore
+    setTimeout(pollPanIndiaStatus, 5000);
   }
 }
 pollPanIndiaStatus();
-setInterval(pollPanIndiaStatus, 30000);
+
+let _panIndiaLastData = null;
 
 async function showPanIndia() {
   $('pan-india-view').style.display = 'block';
@@ -675,7 +683,7 @@ async function showPanIndia() {
   if (belowEl) belowEl.textContent = currentCluster;
   $('pan-india-table').innerHTML = '<p style="color: var(--text-faint); font-size: 13px;">Loading...</p>';
   try {
-    const r = await fetch('/pan_india');
+    const r = await fetch('/pan_india?_t=' + Date.now(), {cache: 'no-store'});
     const data = await r.json();
     if (data.status === 'not_started') {
       $('pan-india-table').innerHTML = '<p style="color: var(--text-faint);">Cache not started. Click "Refresh cache" to build it (takes 5-10 minutes).</p>';
@@ -685,6 +693,7 @@ async function showPanIndia() {
       $('pan-india-table').innerHTML = `<p style="color: var(--text-faint);">Still computing... ${data.progress}% (currently solving: ${data.current_cluster || ''}). Come back in a minute.</p>`;
       return;
     }
+    _panIndiaLastData = data;  // store for slider re-render
     renderPanIndia(data);
   } catch (e) {
     $('pan-india-table').innerHTML = '<p style="color: var(--danger);">Failed to load: ' + e.message + '</p>';
@@ -694,7 +703,6 @@ async function showPanIndia() {
 function renderPanIndia(data) {
   const t = data.totals;
   if (t) {
-    // Build breakdown badge: "17 ok, 2 partial, 8 skipped"
     const breakdown = [];
     if (t.clusters_ok) breakdown.push(`${t.clusters_ok} ok`);
     if (t.clusters_partial) breakdown.push(`<span style="color: #b25500;">${t.clusters_partial} partial</span>`);
@@ -725,17 +733,17 @@ function renderPanIndia(data) {
       </div>
       <div style="font-size: 11px; color: var(--text-faint);">
         Baseline ${fmtL(t.total_baseline)} → Modelled ${fmtL(t.total_payout)} = ${fmtL(t.total_savings_rs)} savings.
-        Settings: April 2026 volume, P75 demand, cluster-specific skew (60-80%), 2i slip 10% / 1i slip 20%, default slab rates.
+        Settings: April 2026 volume, P75 demand, 30% peak shaving cap, 2i slip 10% / 1i slip 20%, calibrated slab rates per cluster.
       </div>
     `;
   }
-  // Sort: solved clusters first by savings desc, then partial, then skipped, then errors
-  const statusOrder = { 'ok': 0, 'partial': 1, 'infeasible': 2, 'skipped_low_volume': 3, 'error': 4 };
+  // Sort by April volume DESC, skipped/error at the bottom
   const sorted = [...data.results].sort((a, b) => {
-    const orderA = statusOrder[a.status] ?? 99;
-    const orderB = statusOrder[b.status] ?? 99;
-    if (orderA !== orderB) return orderA - orderB;
-    return (b.savings_pct || 0) - (a.savings_pct || 0);
+    const aSkip = (a.status === 'skipped_low_volume' || a.status === 'error' || a.status === 'infeasible');
+    const bSkip = (b.status === 'skipped_low_volume' || b.status === 'error' || b.status === 'infeasible');
+    if (aSkip && !bSkip) return 1;
+    if (!aSkip && bSkip) return -1;
+    return (b.volume || 0) - (a.volume || 0);
   });
   let html = '<table style="width:100%; border-collapse: collapse; font-size: 13px;"><thead><tr style="background: #f5f5f7; text-align: left; border-bottom: 2px solid var(--border);"><th style="padding: 10px 8px; font-weight: 600;">Cluster</th><th style="padding: 10px 8px; font-weight: 600;">April vol</th><th style="padding: 10px 8px; font-weight: 600;">Vendors (2i+1i)</th><th style="padding: 10px 8px; font-weight: 600; text-align: right;">SSE savings</th><th style="padding: 10px 8px; font-weight: 600;">Status</th><th style="padding: 10px 8px;"></th></tr></thead><tbody>';
   sorted.forEach((r, idx) => {
@@ -746,8 +754,6 @@ function renderPanIndia(data) {
     else if (r.status === 'skipped_low_volume') badge = `<span style="color: var(--text-faint); font-size: 11px;">skipped (low vol)</span>`;
     else if (r.status === 'infeasible') badge = `<span style="color: var(--danger); font-size: 11px;">infeasible</span>`;
     else badge = `<span style="color: var(--danger); font-size: 11px;">error</span>`;
-    // Color-code savings: >25% green, 15-25% normal, <15% orange
-    // For 'partial' status, gray it out (not a real savings)
     let savingsHtml = '—';
     if (r.status === 'ok') {
       let savingsColor = 'inherit';
@@ -802,18 +808,92 @@ function renderClusterDetail(r) {
     </div>
   `;
   const mix = r.slab_mix.map((p, i) => `S${i+1}: ${p}%`).join(' · ');
+  const fcDisplay = (r.fc_1i && r.fc_2i)
+    ? `<span><strong>1i vendor cost:</strong> ₹${(r.fc_1i/1000).toFixed(0)}K</span><span><strong>2i vendor cost:</strong> ₹${(r.fc_2i/1000).toFixed(0)}K</span>${r.tier ? `<span><strong>Tier:</strong> ${r.tier}</span>` : ''}`
+    : '';
+  // Optimized rates table
+  let ratesTableHTML = '';
+  if (r.optimized_rates_2i && r.optimized_rates_1i) {
+    const rates2i = r.optimized_rates_2i;
+    const rates1i = r.optimized_rates_1i;
+    const adjusted = r.rate_adjusted ? '<span style="color: #d97706; font-weight: 600;"> (rates uplifted to hit floors)</span>' : '<span style="color: var(--success); font-weight: 600;"> (default rates)</span>';
+    ratesTableHTML = `
+      <div style="margin-top: 12px;">
+        <div style="font-size: 12px; font-weight: 600; margin-bottom: 4px;">Optimized slab rates${adjusted}</div>
+        <table style="font-size: 11px; border-collapse: collapse; width: 100%;">
+          <thead><tr style="background: #f5f5f7;">
+            <th style="padding: 4px 8px; text-align: left; border: 1px solid var(--border);">Slab</th>
+            <th style="padding: 4px 8px; text-align: right; border: 1px solid var(--border);">2i rate (₹)</th>
+            <th style="padding: 4px 8px; text-align: right; border: 1px solid var(--border);">1i rate (₹)</th>
+          </tr></thead>
+          <tbody>
+            ${['S1 (0–3 kW)', 'S2 (3–5 kW)', 'S3 (5–10 kW)', 'S4 (>10 kW)'].map((label, i) => `
+              <tr>
+                <td style="padding: 4px 8px; border: 1px solid var(--border);">${label}</td>
+                <td style="padding: 4px 8px; text-align: right; border: 1px solid var(--border);">₹${rates2i[i].toLocaleString('en-IN')}</td>
+                <td style="padding: 4px 8px; text-align: right; border: 1px solid var(--border);">₹${rates1i[i].toLocaleString('en-IN')}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    `;
+  }
+  // Floor met indicator (band-based)
+  let floorIndicator = '';
+  if (r.band_1i && r.band_2i) {
+    const ok = r.floors_met;
+    const icon = ok ? '✓' : '⚠';
+    const color = ok ? 'var(--success)' : '#d97706';
+    const med2i = r.median_profit_2i != null ? `₹${(r.median_profit_2i/1000).toFixed(1)}K` : 'N/A';
+    const med1i = r.median_profit_1i != null ? `₹${(r.median_profit_1i/1000).toFixed(1)}K` : 'N/A';
+    const min2i = r.min_profit_2i != null ? `₹${(r.min_profit_2i/1000).toFixed(1)}K` : 'N/A';
+    const min1i = r.min_profit_1i != null ? `₹${(r.min_profit_1i/1000).toFixed(1)}K` : 'N/A';
+    const b1Low = (r.band_1i[0]/1000).toFixed(0);
+    const b1High = (r.band_1i[1]/1000).toFixed(0);
+    const b2Low = (r.band_2i[0]/1000).toFixed(0);
+    const b2High = (r.band_2i[1]/1000).toFixed(0);
+    floorIndicator = `<span style="color: ${color}; font-weight: 600;">${icon} Median 1i: ${med1i} (band ₹${b1Low}-${b1High}K), Median 2i: ${med2i} (band ₹${b2Low}-${b2High}K) — Bottom: 1i=${min1i}, 2i=${min2i} (need ≥₹0)</span>`;
+  }
+  // Daily demand bar chart
+  let chartHTML = '';
+  if (r.daily_demand && r.daily_demand.length > 0) {
+    const maxD = Math.max(...r.daily_demand);
+    chartHTML = `
+      <div style="margin-top: 12px;">
+        <div style="font-size: 12px; font-weight: 600; margin-bottom: 6px;">Daily demand profile (${r.daily_demand.length} days, ${r.volume} total sites)</div>
+        <div style="display: flex; align-items: flex-end; gap: 2px; padding: 8px; background: white; border: 1px solid var(--border); border-radius: 4px; height: 90px;">
+          ${r.daily_demand.map((d, i) => {
+            const h = maxD > 0 ? (d / maxD * 70) : 0;
+            const isPeak = d === maxD;
+            const color = isPeak ? '#f59e0b' : '#93c5fd';
+            return `
+              <div style="flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 80px;">
+                <div style="font-size: 9px; color: var(--text-soft); margin-bottom: 1px;">${d}</div>
+                <div style="width: 100%; background: ${color}; height: ${h}px; border-radius: 2px 2px 0 0;" title="Day ${i+1}: ${d} sites"></div>
+              </div>
+            `;
+          }).join('')}
+        </div>
+      </div>
+    `;
+  }
   return `
-    <div style="display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start;">
+    ${chartHTML}
+    <div style="display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; margin-top: 12px;">
       ${r.v2 > 0 ? profitTable(r.dist_2i, '2-Install', r.v2, r.avg_2i) : ''}
       ${r.v1 > 0 ? profitTable(r.dist_1i, '1-Install', r.v1, r.avg_1i) : ''}
     </div>
+    ${ratesTableHTML}
     <div style="margin-top: 12px; padding: 8px 12px; background: white; border: 1px solid var(--border); border-radius: 4px; font-size: 11px; color: var(--text-soft); display: flex; flex-wrap: wrap; gap: 16px;">
       <span><strong>Payout:</strong> ${fmtL(r.total_payout)}</span>
       <span><strong>Baseline:</strong> ${fmtL(r.baseline_cost)}</span>
       <span><strong>Savings:</strong> <span style="color: var(--success); font-weight: 600;">${fmtL(r.savings_rs)}</span></span>
       <span><strong>Peak shaving:</strong> ${100 - r.skew}%</span>
+      ${fcDisplay}
       <span><strong>Slab mix:</strong> ${mix}</span>
     </div>
+    ${floorIndicator ? `<div style="margin-top: 6px; font-size: 11px; padding: 0 12px;">${floorIndicator}</div>` : ''}
   `;
 }
 
