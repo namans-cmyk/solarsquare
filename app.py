@@ -161,8 +161,8 @@ def end_skewed_demand(total, days, peak_ratio, skew_pct=100, cluster='Pune'):
     cluster: which cluster's historical distribution to use. Falls back to Pune
              if the cluster name is unknown.
     """
-    if peak_ratio <= 1.001 or skew_pct <= 0.5:
-        # Flat distribution (either explicitly requested or skew is ~0)
+    if skew_pct <= 0.5:
+        # Flat distribution (skew is ~0 means peak shaving is 100%)
         base = total // days
         rem = total - base * days
         arr = [base] * days
@@ -399,7 +399,7 @@ def solve_schedule(v2, v1, days, pair_count, sd_count, peak_day, sl_needed_by_da
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(time_limit)
-    solver.parameters.num_search_workers = 8
+    solver.parameters.num_search_workers = 1
     solver.parameters.random_seed = 42
     # Removed stop_after_first_solution: search for optimal within time_limit
     # (still bounded by the per-call time budget, so won't run forever)
@@ -572,7 +572,7 @@ def optimize_slabs_cpsat(activity, v2, days, dd_pairs_per_day, sd_slabs_per_day,
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(time_limit)
-    solver.parameters.num_search_workers = 8
+    solver.parameters.num_search_workers = 1
     solver.parameters.random_seed = 42
 
     status = solver.Solve(model)
@@ -2018,170 +2018,358 @@ PAN_INDIA_DEFAULTS = {
 }
 
 
-def compute_pan_india_for_cluster(cluster_name):
-    """Run the solver for one cluster with pan-India defaults."""
-    info = CLUSTER_DATA[cluster_name]
-    volume = info.get('april_2026', info['avg_monthly'])
-    if volume < 30:
-        print(f'[pan-india/{cluster_name}] SKIPPED: only {volume} installs in April')
-        return {
-            'cluster': cluster_name,
-            'status': 'skipped_low_volume',
-            'reason': f'Only {volume} installs in April — too low for stable solve',
-            'volume': volume,
-        }
+def _calibrate_rates(vendors, base_rates_2i, base_rates_1i,
+                     target_median_1i=30000, target_median_2i=40000,
+                     band_1i_low=25000, band_1i_high=45000,
+                     band_2i_low=35000, band_2i_high=55000):
+    """
+    Compute calibrated slab rates based on current solution's vendor payouts.
 
-    params = dict(PAN_INDIA_DEFAULTS)
-    params['total_sites'] = volume
-    params['cluster'] = cluster_name
-    params['skew_pct'] = info.get('pan_india_skew', 70)
-    # Use cluster's actual slab mix
-    params['slab_mix'] = info['slab_mix']
-    # Use cluster's actual baseline Rs/site (P50 of Jan-Mar 2026 actuals)
-    cluster_baseline = info.get('baseline_per_site', PAN_INDIA_DEFAULTS['baseline_per_site'])
-    params['baseline_per_site'] = cluster_baseline
-    # DEEP MODE: pan-India runs in background and can afford to search much harder
-    # for the truly optimal solution per cluster. Override iteration/time caps.
-    params['_deep_mode'] = True
+    Returns: (new_rates_2i, new_rates_1i, changed_2i, changed_1i)
+    """
+    # Only consider vendors with actual work (payout > 0)
+    vendors_2i = sorted([v for v in vendors if v['type'] == '2-Install' and v.get('payout', 0) > 0], key=lambda x: x['profit'])
+    vendors_1i = sorted([v for v in vendors if v['type'] == '1-Install' and v.get('payout', 0) > 0], key=lambda x: x['profit'])
 
-    # Detailed pre-solve log so you can verify inputs
-    print(f'\n[pan-india/{cluster_name}] ============================================')
-    print(f'[pan-india/{cluster_name}] INPUT PARAMS:')
-    print(f'[pan-india/{cluster_name}]   total_sites:    {params["total_sites"]} (April 2026)')
-    print(f'[pan-india/{cluster_name}]   days:           {params["days"]}')
-    print(f'[pan-india/{cluster_name}]   peak_ratio:     {params["peak_ratio"]} (P75)')
-    print(f'[pan-india/{cluster_name}]   skew_pct:       {params["skew_pct"]}% (data quality: {info["months_used"]} months)')
-    print(f'[pan-india/{cluster_name}]   slab_mix:       S1={params["slab_mix"][0]} S2={params["slab_mix"][1]} S3={params["slab_mix"][2]} S4={params["slab_mix"][3]}')
-    print(f'[pan-india/{cluster_name}]   slab_rates_2i:  {params["slab_rates"]}')
-    print(f'[pan-india/{cluster_name}]   slab_rates_1i:  {params["slab_rates_1i"]}')
-    print(f'[pan-india/{cluster_name}]   dd_elig_slabs:  S1={params["dd_elig_slabs"][0]} S2={params["dd_elig_slabs"][1]} S3={params["dd_elig_slabs"][2]} S4={params["dd_elig_slabs"][3]}')
-    print(f'[pan-india/{cluster_name}]   elig_pct:       {params["elig_pct"]*100}%')
-    print(f'[pan-india/{cluster_name}]   sl2_rate:       {params["sl2_rate"]*100}%  (2i slip)')
-    print(f'[pan-india/{cluster_name}]   sl1_rate:       {params["sl1_rate"]*100}%  (1i slip)')
-    print(f'[pan-india/{cluster_name}]   cost_2i:        Rs {params["cost_2i"]:,.0f}')
-    print(f'[pan-india/{cluster_name}]   cost_1i:        Rs {params["cost_1i"]:,.0f}')
-    print(f'[pan-india/{cluster_name}]   dd_discount:    {params["dd_discount"]}')
-    print(f'[pan-india/{cluster_name}]   baseline/site:  Rs {cluster_baseline:,.0f}  (P50 of Jan-Mar 2026 actuals)')
-    print(f'[pan-india/{cluster_name}]   max_work_days:  {params["max_working_days"]}')
+    new_rates_2i = list(base_rates_2i)
+    new_rates_1i = list(base_rates_1i)
+    changed_2i = False
+    changed_1i = False
 
+    def median_of(arr):
+        return arr[len(arr) // 2] if arr else None
+
+    def compute_mult(target, median_v, worst_v, band_low, band_high, has_loss):
+        """Single multiplier that lands median ~ target, with breakeven floor.
+        If any vendor has loss (has_loss=True), FORCE calibration to raise rates even if median is in band."""
+        if median_v is None or median_v.get('payout', 0) <= 0:
+            return 1.0
+        median_payout = median_v['payout']
+        median_profit = median_v['profit']
+
+        # Already in band AND no loss? No change.
+        if (band_low <= median_profit <= band_high) and not has_loss:
+            return 1.0
+
+        # Multiplier to land median at target
+        mult_target = 1.0 + (target - median_profit) / median_payout
+
+        # Breakeven multiplier: worst vendor must end at >= 0
+        if worst_v is None or worst_v.get('payout', 0) <= 0:
+            mult_breakeven = 0.0
+        else:
+            worst_payout = worst_v['payout']
+            worst_profit = worst_v['profit']
+            mult_breakeven = 1.0 + (0 - worst_profit) / worst_payout
+
+        # When raising (median below target OR has loss), pick max(target, breakeven, 1.0)
+        if median_profit < target or has_loss:
+            return max(mult_target, mult_breakeven, 1.0)
+        else:
+            # Median above target — lower rates, bounded by breakeven
+            return max(mult_target, mult_breakeven)
+
+    # 2i side
+    if vendors_2i:
+        med = median_of(vendors_2i)
+        worst = vendors_2i[0]
+        has_loss = worst['profit'] < 0
+        mult = compute_mult(target_median_2i, med, worst, band_2i_low, band_2i_high, has_loss)
+        # Lower threshold for triggering rate change when there's a loss (so even small bumps apply)
+        threshold = 0.002 if has_loss else 0.01
+        if abs(mult - 1.0) > threshold:
+            new_rates_2i = [max(100, round(r * mult / 100) * 100) for r in base_rates_2i]
+            changed_2i = True
+
+    # 1i side
+    if vendors_1i:
+        med = median_of(vendors_1i)
+        worst = vendors_1i[0]
+        has_loss = worst['profit'] < 0
+        mult = compute_mult(target_median_1i, med, worst, band_1i_low, band_1i_high, has_loss)
+        threshold = 0.002 if has_loss else 0.01
+        if abs(mult - 1.0) > threshold:
+            new_rates_1i = [max(100, round(r * mult / 100) * 100) for r in base_rates_1i]
+            changed_1i = True
+
+    return new_rates_2i, new_rates_1i, changed_2i, changed_1i
+
+
+def _build_result_from_solve(cluster_name, result, info, params, cluster_baseline, fc_2i, fc_1i, tier,
+                              elapsed_sec, rates_2i, rates_1i, rate_adjusted):
+    """Construct the result dict from a solver result."""
+    vendors = result.get('vendors', [])
+    v2 = result.get('v2', 0)
+    v1 = result.get('v1', 0)
+    daily_demand_arr = result.get('daily', [])
+
+    profits_2i = sorted([v['profit'] for v in vendors if v['type'] == '2-Install'])
+    profits_1i = sorted([v['profit'] for v in vendors if v['type'] == '1-Install'])
+
+    def pxx(arr, p):
+        if not arr: return 0
+        idx = (p / 100) * (len(arr) - 1)
+        lo = int(idx); hi = min(lo+1, len(arr)-1)
+        frac = idx - lo
+        return arr[lo] + (arr[hi] - arr[lo]) * frac
+
+    dist_2i = {f'P{p}': round(pxx(profits_2i, p)) for p in [0, 25, 50, 75, 90, 100]}
+    dist_1i = {f'P{p}': round(pxx(profits_1i, p)) for p in [0, 25, 50, 75, 90, 100]}
+    avg_2i = round(sum(profits_2i) / len(profits_2i)) if profits_2i else 0
+    avg_1i = round(sum(profits_1i) / len(profits_1i)) if profits_1i else 0
+
+    total_payout = result.get('total_payout', 0)
+    volume = params['total_sites']
+    baseline_total = volume * cluster_baseline
+    savings = baseline_total - total_payout
+    savings_pct = (savings / baseline_total * 100) if baseline_total > 0 else 0
+
+    median_2i = profits_2i[len(profits_2i)//2] if profits_2i else None
+    median_1i = profits_1i[len(profits_1i)//2] if profits_1i else None
+    min_2i = min(profits_2i) if profits_2i else None
+    min_1i = min(profits_1i) if profits_1i else None
+
+    unprofitable_vendors = [(v['name'], v['profit']) for v in vendors if v['profit'] < 0]
+    unprofitable_amount = sum(-p for _, p in unprofitable_vendors)
+    all_profitable = len(unprofitable_vendors) == 0
+    final_status = 'ok' if all_profitable else 'partial'
+
+    return {
+        'cluster': cluster_name,
+        'status': final_status,
+        'volume': volume,
+        'skew': params['skew_pct'],
+        'tier': tier,
+        'fc_2i': fc_2i,
+        'fc_1i': fc_1i,
+        'v2': v2, 'v1': v1, 'total_v': v2 + v1,
+        'total_payout': round(total_payout),
+        'baseline_cost': round(baseline_total),
+        'savings_rs': round(savings),
+        'savings_pct': round(savings_pct, 1),
+        'dist_2i': dist_2i, 'dist_1i': dist_1i,
+        'avg_2i': avg_2i, 'avg_1i': avg_1i,
+        'median_profit_2i': round(median_2i) if median_2i is not None else None,
+        'median_profit_1i': round(median_1i) if median_1i is not None else None,
+        'min_profit_2i': round(min_2i) if min_2i is not None else None,
+        'min_profit_1i': round(min_1i) if min_1i is not None else None,
+        'months_used': info['months_used'],
+        'slab_mix': info['slab_mix'],
+        'is_noisy': info['months_used'] <= 2,
+        'elapsed_sec': round(elapsed_sec, 2),
+        'rate_adjusted': rate_adjusted,
+        'optimized_rates_2i': list(rates_2i),
+        'optimized_rates_1i': list(rates_1i),
+        'floors_met': all_profitable,
+        'all_profitable': all_profitable,
+        'unprofitable_count': len(unprofitable_vendors),
+        'unprofitable_amount': round(unprofitable_amount),
+        'daily_demand': daily_demand_arr,
+    }
+
+
+def compute_pan_india_for_cluster(cluster_name, volume_scale=1.0):
+    """
+    Pan-India solve with single-pass rate calibration.
+
+    Args:
+        cluster_name: cluster to solve
+        volume_scale: scale factor on April volume (1.0 = April, 1.5 = +50% growth)
+
+    Algorithm:
+      1. Solve at default rates → baseline_result
+      2. Calibrate rates (raise if vendors losing money, lower if over-earning)
+      3. Solve at calibrated rates → calibrated_result
+      4. Pick the BETTER of the two by savings %, but PREFER all-profitable
+      5. On any exception, return error dict (never crash the cache thread)
+
+    Max 2 solver calls per cluster — fast.
+    """
     import time as _time
     t_start = _time.time()
+
     try:
-        result = run_solver(params)
-        elapsed = _time.time() - t_start
-        if result is None or result.get('_diagnostic_only'):
-            print(f'[pan-india/{cluster_name}] INFEASIBLE after {elapsed:.1f}s')
+        if cluster_name not in CLUSTER_DATA:
+            return {'cluster': cluster_name, 'status': 'error', 'error': 'unknown cluster', 'volume': 0}
+
+        info = CLUSTER_DATA[cluster_name]
+        april_volume = info.get('april_2026', info['avg_monthly'])
+        # Apply scenario scale (1.0 = April base)
+        volume = max(1, int(round(april_volume * volume_scale)))
+        # Skip threshold checks against the SCALED volume, not April (so 100 sites @ 80% = 80, skipped)
+        if volume < 110:
             return {
-                'cluster': cluster_name,
-                'status': 'infeasible',
-                'volume': volume,
-                'skew': params['skew_pct'],
+                'cluster': cluster_name, 'status': 'skipped_low_volume',
+                'reason': f'Only {volume} installs at this volume scenario (need ≥110)', 'volume': volume,
+                'april_volume': april_volume, 'volume_scale': volume_scale,
             }
-        # Extract just what we need for the pan-India table
-        vendors = result.get('vendors', [])
-        v2 = result.get('v2', 0)
-        v1 = result.get('v1', 0)
-        # Profit distributions
-        profits_2i = sorted([v['profit'] for v in vendors if v['type'] == '2-Install'])
-        profits_1i = sorted([v['profit'] for v in vendors if v['type'] == '1-Install'])
-        def pxx(arr, p):
-            if not arr:
-                return 0
-            idx = (p / 100) * (len(arr) - 1)
-            lo = int(idx); hi = min(lo+1, len(arr)-1)
-            frac = idx - lo
-            return arr[lo] + (arr[hi] - arr[lo]) * frac
-        dist_2i = {f'P{p}': round(pxx(profits_2i, p)) for p in [0, 25, 50, 75, 90, 100]}
-        dist_1i = {f'P{p}': round(pxx(profits_1i, p)) for p in [0, 25, 50, 75, 90, 100]}
-        avg_2i = round(sum(profits_2i) / len(profits_2i)) if profits_2i else 0
-        avg_1i = round(sum(profits_1i) / len(profits_1i)) if profits_1i else 0
-        # Compute SSE savings using THIS CLUSTER's baseline (not the global default)
-        total_payout = result.get('total_payout', 0)
-        baseline_total = volume * cluster_baseline
-        savings = baseline_total - total_payout
-        savings_pct = (savings / baseline_total * 100) if baseline_total > 0 else 0
 
-        # Detailed result log
-        print(f'[pan-india/{cluster_name}] RESULT after {elapsed:.1f}s:')
-        print(f'[pan-india/{cluster_name}]   Vendors:        {v2} (2i) + {v1} (1i) = {v2+v1} total')
-        print(f'[pan-india/{cluster_name}]   Modelled cost:  Rs {total_payout:,.0f}')
-        print(f'[pan-india/{cluster_name}]   Baseline cost:  Rs {baseline_total:,.0f}')
-        print(f'[pan-india/{cluster_name}]   Savings:        Rs {savings:,.0f} ({savings_pct:.1f}%)')
-        if profits_2i:
-            print(f'[pan-india/{cluster_name}]   2i profits:     min=Rs {min(profits_2i):,.0f} median=Rs {profits_2i[len(profits_2i)//2]:,.0f} max=Rs {max(profits_2i):,.0f}')
-        if profits_1i:
-            print(f'[pan-india/{cluster_name}]   1i profits:     min=Rs {min(profits_1i):,.0f} median=Rs {profits_1i[len(profits_1i)//2]:,.0f} max=Rs {max(profits_1i):,.0f}')
+        fc_2i = info.get('fc_2i', 180000)
+        fc_1i = info.get('fc_1i', 140000)
+        tier = info.get('tier', 'A')
+        cluster_baseline = info.get('baseline_per_site', PAN_INDIA_DEFAULTS['baseline_per_site'])
 
-        # Sanity: profitability check
-        unprofitable_vendors = [(v['name'], v['profit']) for v in vendors if v['profit'] < 0]
-        unprofitable_amount = sum(-p for _, p in unprofitable_vendors)
-        all_profitable = len(unprofitable_vendors) == 0
-        if not all_profitable:
-            print(f'[pan-india/{cluster_name}]   ⚠ UNPROFITABLE VENDORS: {unprofitable_vendors}')
-            print(f'[pan-india/{cluster_name}]   ⚠ Total loss: Rs {unprofitable_amount:,.0f}')
+        params = dict(PAN_INDIA_DEFAULTS)
+        params['total_sites'] = volume
+        params['cluster'] = cluster_name
+        params['skew_pct'] = info.get('pan_india_skew', 70)
+        params['slab_mix'] = info['slab_mix']
+        params['baseline_per_site'] = cluster_baseline
+        params['cost_2i'] = fc_2i
+        params['cost_1i'] = fc_1i
+        params['_deep_mode'] = False  # fast
 
-        # Sanity: total payout matches sum of vendor payouts
-        sum_vendor_payouts = sum(v['payout'] for v in vendors)
-        if abs(sum_vendor_payouts - total_payout) > 1:
-            print(f'[pan-india/{cluster_name}]   ⚠ PAYOUT MISMATCH: result={total_payout} vs sum(vendor.payout)={sum_vendor_payouts}')
+        print(f'[pan-india/{cluster_name}] Vol={volume} Tier={tier} FC=Rs {fc_1i:,}/{fc_2i:,} Baseline=Rs {cluster_baseline:,}')
 
-        # Determine final status:
-        # - 'ok' only if ALL vendors are profitable
-        # - 'partial' if some vendors lose money (solver returned a degraded solution)
-        final_status = 'ok' if all_profitable else 'partial'
-        if not all_profitable:
-            print(f'[pan-india/{cluster_name}] STATUS: PARTIAL (some vendors unprofitable — solution not viable)')
+        # ============ Step 1: baseline solve at default rates ============
+        try:
+            baseline_result = run_solver(params)
+        except Exception as e:
+            print(f'[pan-india/{cluster_name}] Baseline solver crashed: {e}')
+            return {
+                'cluster': cluster_name, 'status': 'error',
+                'error': f'baseline solve failed: {str(e)[:150]}',
+                'volume': volume, 'elapsed_sec': round(_time.time() - t_start, 2),
+            }
 
-        return {
-            'cluster': cluster_name,
-            'status': final_status,
-            'volume': volume,
-            'skew': params['skew_pct'],
-            'v2': v2,
-            'v1': v1,
-            'total_v': v2 + v1,
-            'total_payout': round(total_payout),
-            'baseline_cost': round(baseline_total),
-            'savings_rs': round(savings),
-            'savings_pct': round(savings_pct, 1),
-            'dist_2i': dist_2i,
-            'dist_1i': dist_1i,
-            'avg_2i': avg_2i,
-            'avg_1i': avg_1i,
-            'months_used': info['months_used'],
-            'slab_mix': info['slab_mix'],
-            'is_noisy': info['months_used'] <= 2,
-            'elapsed_sec': round(elapsed, 2),
-            'all_profitable': all_profitable,
-            'unprofitable_count': len(unprofitable_vendors),
-            'unprofitable_amount': round(unprofitable_amount),
-        }
+        if baseline_result is None or baseline_result.get('_diagnostic_only'):
+            return {
+                'cluster': cluster_name, 'status': 'infeasible', 'volume': volume,
+                'tier': tier, 'fc_1i': fc_1i, 'fc_2i': fc_2i,
+                'elapsed_sec': round(_time.time() - t_start, 2),
+            }
+
+        baseline_built = _build_result_from_solve(
+            cluster_name, baseline_result, info, params, cluster_baseline,
+            fc_2i, fc_1i, tier, _time.time() - t_start,
+            PAN_INDIA_DEFAULTS['slab_rates'], PAN_INDIA_DEFAULTS['slab_rates_1i'],
+            rate_adjusted=False
+        )
+        print(f'[pan-india/{cluster_name}]   Baseline: v={baseline_built["v2"]}+{baseline_built["v1"]}, '
+              f'savings={baseline_built["savings_pct"]}%, status={baseline_built["status"]}, '
+              f'median 2i=Rs {baseline_built.get("median_profit_2i")}, median 1i=Rs {baseline_built.get("median_profit_1i")}')
+
+        # ============ Step 2: rate calibration ============
+        baseline_vendors = baseline_result.get('vendors', [])
+        if not baseline_vendors:
+            return baseline_built  # nothing to calibrate
+
+        try:
+            new_rates_2i, new_rates_1i, ch_2i, ch_1i = _calibrate_rates(
+                baseline_vendors,
+                PAN_INDIA_DEFAULTS['slab_rates'], PAN_INDIA_DEFAULTS['slab_rates_1i']
+            )
+        except Exception as e:
+            print(f'[pan-india/{cluster_name}]   Calibration math failed: {e}, using baseline')
+            return baseline_built
+
+        if not (ch_2i or ch_1i):
+            print(f'[pan-india/{cluster_name}]   No calibration needed (already in band)')
+            return baseline_built
+
+        print(f'[pan-india/{cluster_name}]   Calibrated rates: 2i={new_rates_2i}, 1i={new_rates_1i}')
+
+        # ============ Step 3: solve at calibrated rates ============
+        params_cal = dict(params)
+        params_cal['slab_rates'] = new_rates_2i
+        params_cal['slab_rates_1i'] = new_rates_1i
+
+        try:
+            calibrated_result = run_solver(params_cal)
+        except Exception as e:
+            print(f'[pan-india/{cluster_name}]   Calibrated solve crashed: {e}, using baseline')
+            return baseline_built
+
+        if calibrated_result is None or calibrated_result.get('_diagnostic_only'):
+            print(f'[pan-india/{cluster_name}]   Calibrated solve infeasible, using baseline')
+            return baseline_built
+
+        calibrated_built = _build_result_from_solve(
+            cluster_name, calibrated_result, info, params_cal, cluster_baseline,
+            fc_2i, fc_1i, tier, _time.time() - t_start,
+            new_rates_2i, new_rates_1i,
+            rate_adjusted=True
+        )
+        print(f'[pan-india/{cluster_name}]   Calibrated: v={calibrated_built["v2"]}+{calibrated_built["v1"]}, '
+              f'savings={calibrated_built["savings_pct"]}%, status={calibrated_built["status"]}, '
+              f'median 2i=Rs {calibrated_built.get("median_profit_2i")}, median 1i=Rs {calibrated_built.get("median_profit_1i")}')
+
+        # ============ Step 3b: if still has loss, try one more calibration pass ============
+        if not calibrated_built['all_profitable']:
+            cal2_vendors = calibrated_result.get('vendors', [])
+            try:
+                new_rates_2i_v2, new_rates_1i_v2, ch_2i_v2, ch_1i_v2 = _calibrate_rates(
+                    cal2_vendors, new_rates_2i, new_rates_1i
+                )
+            except Exception as e:
+                print(f'[pan-india/{cluster_name}]   Second calibration math failed: {e}')
+                ch_2i_v2 = ch_1i_v2 = False
+
+            if ch_2i_v2 or ch_1i_v2:
+                print(f'[pan-india/{cluster_name}]   Second pass rates: 2i={new_rates_2i_v2}, 1i={new_rates_1i_v2}')
+                params_cal2 = dict(params_cal)
+                params_cal2['slab_rates'] = new_rates_2i_v2
+                params_cal2['slab_rates_1i'] = new_rates_1i_v2
+                try:
+                    cal2_result = run_solver(params_cal2)
+                except Exception as e:
+                    cal2_result = None
+                if cal2_result is not None and not cal2_result.get('_diagnostic_only'):
+                    cal2_built = _build_result_from_solve(
+                        cluster_name, cal2_result, info, params_cal2, cluster_baseline,
+                        fc_2i, fc_1i, tier, _time.time() - t_start,
+                        new_rates_2i_v2, new_rates_1i_v2,
+                        rate_adjusted=True
+                    )
+                    print(f'[pan-india/{cluster_name}]   Pass 2: v={cal2_built["v2"]}+{cal2_built["v1"]}, '
+                          f'savings={cal2_built["savings_pct"]}%, status={cal2_built["status"]}')
+                    # Use pass 2 if it's better
+                    cal2_score = (1 if cal2_built['all_profitable'] else 0, cal2_built['savings_pct'])
+                    calibrated_score_current = (1 if calibrated_built['all_profitable'] else 0, calibrated_built['savings_pct'])
+                    if cal2_score > calibrated_score_current:
+                        calibrated_built = cal2_built
+
+        # ============ Step 4: pick the better ============
+        # Prefer all_profitable > savings %
+        baseline_score = (1 if baseline_built['all_profitable'] else 0, baseline_built['savings_pct'])
+        calibrated_score = (1 if calibrated_built['all_profitable'] else 0, calibrated_built['savings_pct'])
+
+        if calibrated_score > baseline_score:
+            print(f'[pan-india/{cluster_name}]   ✓ Calibrated is better')
+            return calibrated_built
+        else:
+            print(f'[pan-india/{cluster_name}]   Baseline is at least as good, using it')
+            return baseline_built
+
     except Exception as e:
         elapsed = _time.time() - t_start
-        print(f'[pan-india/{cluster_name}] ERROR after {elapsed:.1f}s: {e}')
         import traceback
+        print(f'[pan-india/{cluster_name}] UNEXPECTED EXCEPTION: {e}')
         traceback.print_exc()
         return {
-            'cluster': cluster_name,
-            'status': 'error',
+            'cluster': cluster_name, 'status': 'error',
             'error': str(e)[:200],
-            'volume': volume,
+            'volume': info.get('april_2026', 0) if cluster_name in CLUSTER_DATA else 0,
+            'elapsed_sec': round(elapsed, 2),
         }
 
 
-def compute_pan_india_all():
-    """Run all clusters. Called at startup in a background thread."""
+def compute_pan_india_all(volume_scale=1.0):
+    """Run all clusters at the given volume scale. Called at startup in a background thread."""
     global PAN_INDIA_CACHE
     PAN_INDIA_CACHE['status'] = 'computing'
     PAN_INDIA_CACHE['started_at'] = datetime.datetime.now().isoformat()
+    PAN_INDIA_CACHE['volume_scale'] = volume_scale
     PAN_INDIA_CACHE['results'] = []
     PAN_INDIA_CACHE['progress'] = 0
     cluster_names = sorted(CLUSTER_DATA.keys())
     n = len(cluster_names)
+    scenario_label = f'@ {int(volume_scale*100)}% volume' if volume_scale != 1.0 else '@ April base'
+    print(f'\n[pan-india] Starting compute {scenario_label}')
     for idx, name in enumerate(cluster_names):
         PAN_INDIA_CACHE['current_cluster'] = name
-        print(f'[pan-india] [{idx+1}/{n}] Solving {name}...')
-        res = compute_pan_india_for_cluster(name)
+        print(f'[pan-india] [{idx+1}/{n}] Solving {name} {scenario_label}...')
+        res = compute_pan_india_for_cluster(name, volume_scale=volume_scale)
         PAN_INDIA_CACHE['results'].append(res)
         PAN_INDIA_CACHE['progress'] = round((idx + 1) / n * 100)
         print(f'[pan-india] [{idx+1}/{n}] {name}: {res.get("status")} '
@@ -2235,7 +2423,18 @@ def compute_pan_india_all():
 @app.route('/pan_india')
 def pan_india_route():
     """Return cached pan-India results."""
-    return jsonify(PAN_INDIA_CACHE)
+    import math
+    def _sanitize(obj):
+        """Replace inf/-inf/NaN with None for JSON compatibility."""
+        if isinstance(obj, dict):
+            return {k: _sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_sanitize(x) for x in obj]
+        if isinstance(obj, float):
+            if math.isinf(obj) or math.isnan(obj):
+                return None
+        return obj
+    return jsonify(_sanitize(PAN_INDIA_CACHE))
 
 
 @app.route('/pan_india/refresh', methods=['POST'])
@@ -2247,6 +2446,26 @@ def pan_india_refresh_route():
     t = threading.Thread(target=compute_pan_india_all, daemon=True)
     t.start()
     return jsonify({'ok': True, 'message': 'Pan-India compute started in background'})
+
+
+@app.route('/pan_india/run_scenario', methods=['POST'])
+def pan_india_run_scenario_route():
+    """Trigger a recompute at a custom volume scale (in background).
+
+    Body: {"volume_scale": 1.2}  # 1.0 = April base, 1.2 = +20% growth
+    """
+    import threading
+    if PAN_INDIA_CACHE['status'] == 'computing':
+        return jsonify({'ok': False, 'reason': 'Already computing — wait for current run to finish'}), 200
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        scale = float(body.get('volume_scale', 1.0))
+        scale = max(0.1, min(5.0, scale))  # clamp 10%-500%
+    except Exception as e:
+        return jsonify({'ok': False, 'reason': f'bad input: {e}'}), 200
+    t = threading.Thread(target=lambda: compute_pan_india_all(volume_scale=scale), daemon=True)
+    t.start()
+    return jsonify({'ok': True, 'message': f'Scenario compute started at {int(scale*100)}% volume'})
 
 
 @app.route('/solve', methods=['POST'])
