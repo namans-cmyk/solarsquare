@@ -1,5 +1,5 @@
 flask
-ortools
+ortools==9.15.6755
 numpy
 pandas
 gunicorn
